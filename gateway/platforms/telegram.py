@@ -20,7 +20,6 @@ try:
     from telegram import Update, Bot, Message
     from telegram.ext import (
         Application,
-        CommandHandler,
         MessageHandler as TelegramMessageHandler,
         ContextTypes,
         filters,
@@ -34,7 +33,6 @@ except ImportError:
     Bot = Any
     Message = Any
     Application = Any
-    CommandHandler = Any
     TelegramMessageHandler = Any
     HTTPXRequest = Any
     filters = None
@@ -528,12 +526,8 @@ class TelegramAdapter(BasePlatformAdapter):
             
             # Register handlers
             self._app.add_handler(TelegramMessageHandler(
-                filters.TEXT & ~filters.COMMAND,
+                filters.TEXT,
                 self._handle_text_message
-            ))
-            self._app.add_handler(TelegramMessageHandler(
-                filters.COMMAND,
-                self._handle_command
             ))
             self._app.add_handler(TelegramMessageHandler(
                 filters.LOCATION | getattr(filters, "VENUE", filters.LOCATION),
@@ -1532,25 +1526,23 @@ class TelegramAdapter(BasePlatformAdapter):
         Telegram clients split long messages into multiple updates.  Buffer
         rapid successive text messages from the same user/chat and aggregate
         them into a single MessageEvent before dispatching.
+
+        Slash commands (e.g. /help, /skills) are detected by leading '/' and
+        routed with MessageType.COMMAND so the gateway's command dispatcher
+        handles them properly, bypassing the group-chat mention requirement.
         """
         if not update.message or not update.message.text:
             return
-        if not self._should_process_message(update.message):
+
+        text = update.message.text or ""
+        is_command = text.startswith("/")
+        if not self._should_process_message(update.message, is_command=is_command):
             return
 
-        event = self._build_message_event(update.message, MessageType.TEXT)
+        msg_type = MessageType.COMMAND if is_command else MessageType.TEXT
+        event = self._build_message_event(update.message, msg_type)
         event.text = self._clean_bot_trigger_text(event.text)
         self._enqueue_text_event(event)
-    
-    async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle incoming command messages."""
-        if not update.message or not update.message.text:
-            return
-        if not self._should_process_message(update.message, is_command=True):
-            return
-        
-        event = self._build_message_event(update.message, MessageType.COMMAND)
-        await self.handle_message(event)
     
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming location/venue pin messages."""
