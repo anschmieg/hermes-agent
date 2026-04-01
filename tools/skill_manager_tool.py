@@ -379,27 +379,23 @@ def _patch_skill(
 
     content = target.read_text(encoding="utf-8")
 
-    count = content.count(old_string)
-    if count == 0:
+    # Use the same fuzzy matching engine as the file patch tool.
+    # This handles whitespace normalization, indentation differences,
+    # escape sequences, and block-anchor matching — saving the agent
+    # from exact-match failures on minor formatting mismatches.
+    from tools.fuzzy_match import fuzzy_find_and_replace
+
+    new_content, match_count, match_error = fuzzy_find_and_replace(
+        content, old_string, new_string, replace_all
+    )
+    if match_error:
         # Show a short preview of the file so the model can self-correct
         preview = content[:500] + ("..." if len(content) > 500 else "")
         return {
             "success": False,
-            "error": "old_string not found in the file.",
+            "error": match_error,
             "file_preview": preview,
         }
-
-    if count > 1 and not replace_all:
-        return {
-            "success": False,
-            "error": (
-                f"old_string matched {count} times. Provide more surrounding context "
-                f"to make the match unique, or set replace_all=true to replace all occurrences."
-            ),
-            "match_count": count,
-        }
-
-    new_content = content.replace(old_string, new_string) if replace_all else content.replace(old_string, new_string, 1)
 
     # If patching SKILL.md, validate frontmatter is still intact
     if not file_path:
@@ -419,10 +415,9 @@ def _patch_skill(
         _atomic_write_text(target, original_content)
         return {"success": False, "error": scan_error}
 
-    replacements = count if replace_all else 1
     return {
         "success": True,
-        "message": f"Patched {'SKILL.md' if not file_path else file_path} in skill '{name}' ({replacements} replacement{'s' if replacements > 1 else ''}).",
+        "message": f"Patched {'SKILL.md' if not file_path else file_path} in skill '{name}' ({match_count} replacement{'s' if match_count > 1 else ''}).",
     }
 
 
