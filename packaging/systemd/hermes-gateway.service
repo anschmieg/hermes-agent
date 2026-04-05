@@ -1,0 +1,19 @@
+[Unit]
+Description=Hermes Agent Gateway
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/hermes
+EnvironmentFile=/home/hermes/.env
+# TELEGRAM_BOT_TOKEN must be set in the service override or .env file
+Environment=PATH=/home/hermes/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=HERMES_HOME=/home/hermes/.hermes
+ExecStart=/home/hermes/.local/bin/hermes gateway run --replace
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

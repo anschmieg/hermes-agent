@@ -1,0 +1,17 @@
+[Unit]
+Description=OpenCrabs AI Agent
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/hermes
+EnvironmentFile=/home/hermes/.env
+# TELEGRAM_BOT_TOKEN must be set in the service override or .env file
+ExecStart=/home/hermes/.local/bin/opencrabs daemon
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
