@@ -31,6 +31,10 @@ import os
 import re
 from typing import Any, Dict, List, Optional
 
+from agent.mistral_guidance import (
+    get_mistral_operational_guidance,
+    is_mistral_model,
+)
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
@@ -452,7 +456,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Tool-use enforcement: tells the model to actually call tools instead
     # of describing intended actions.  Controlled by config.yaml
     # agent.tool_use_enforcement:
-    #   "auto" (default) — matches TOOL_USE_ENFORCEMENT_MODELS
+    #   "auto" (default) — matches TOOL_USE_ENFORCEMENT_MODELS plus Mistral families
     #   true  — always inject (all models)
     #   false — never inject
     #   list  — custom model-name substrings to match
@@ -467,12 +471,22 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             model_lower = (agent.model or "").lower()
             _inject = any(p.lower() in model_lower for p in _enforce if isinstance(p, str))
         else:
-            # "auto" or any unrecognised value — use hardcoded defaults
+            # "auto" or any unrecognised value — use hardcoded defaults plus
+            # the Mistral-family matcher (Mistral/Ministral/Codestral/Pixtral).
             model_lower = (agent.model or "").lower()
-            _inject = any(p in model_lower for p in TOOL_USE_ENFORCEMENT_MODELS)
+            _inject = (
+                any(p in model_lower for p in TOOL_USE_ENFORCEMENT_MODELS)
+                or is_mistral_model(agent.model)
+            )
         if _inject:
             stable_parts.append(TOOL_USE_ENFORCEMENT_GUIDANCE)
             _model_lower = (agent.model or "").lower()
+            # Mistral-family guidance adds intent discrimination, persistence,
+            # retry/recovery, and verification without forcing ordinary chat
+            # into a coding-agent workflow.
+            _mistral_guidance = get_mistral_operational_guidance(agent.model, _inject)
+            if _mistral_guidance:
+                stable_parts.append(_mistral_guidance)
             # Google model operational guidance (conciseness, absolute
             # paths, parallel tool calls, verify-before-edit, etc.)
             if "gemini" in _model_lower or "gemma" in _model_lower:
