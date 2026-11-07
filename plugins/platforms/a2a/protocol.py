@@ -19,6 +19,7 @@ from typing import Any, Optional
 
 from gateway.platforms._shared import coerce_port as _coerce_int
 from hermes_constants import get_hermes_home
+from .ledger import DurableTaskLedger, IdempotencyConflict
 
 PROTOCOL_VERSION = "1.0"
 
@@ -37,6 +38,7 @@ INPUT_REQUIRED_MARKER = "[INPUT_REQUIRED]"
 ERR_PARSE, ERR_INVALID_PARAMS, ERR_METHOD_NOT_FOUND = -32700, -32602, -32601
 ERR_TASK_NOT_FOUND, ERR_TASK_NOT_CANCELABLE = -32001, -32002  # A2A spec: TaskNotFoundError / TaskNotCancelableError
 ERR_UNAUTHORIZED, ERR_RATE_LIMITED, ERR_UNTRUSTED_PEER = -32050, -32051, -32052
+ERR_IDEMPOTENCY_CONFLICT = -32053
 
 # Anti-loop: max inbound turns per context. A2A_MAX_PINGPONG_TURNS env, capped at 20.
 _DEFAULT_MAX_PINGPONG, _HARD_MAX_PINGPONG = 5, 20
@@ -308,23 +310,81 @@ class TaskStore:
 
     _MAX_TERMINAL = 500
 
-    def __init__(self) -> None:
-        self._tasks: OrderedDict[str, dict[str, Any]] = OrderedDict()
+    def __init__(self, ledger: Optional[DurableTaskLedger] = None) -> None:
+        self._ledger = ledger
+        self._tasks: OrderedDict[str, dict[str, Any]] = OrderedDict(
+            (r["task_id"], r) for r in ledger.records()) if ledger else OrderedDict()
         self._watchers: dict[str, list[Future]] = {}
         self._lock = threading.Lock()
+        self._admissions: dict[tuple[str, str], tuple[str, str]] = {}
+
+    def admit(self, peer: str, message_id: str, params: dict, context_id: str,
+              agent_slug: str = "", tenant: str = "", input_id: str = "") -> tuple[dict, bool]:
+        """Durably reserve one task for a trusted peer/messageId before dispatch.
+
+        The uniqueness key is intentionally peer+messageId, *not* tenant+peer:
+        trying to reuse an identity in another tenant is a conflict, not a
+        means of reading/replaying someone else's task.
+        """
+        if not peer or not message_id:
+            raise ValueError("authenticated peer and messageId required")
+        if self._ledger:
+            rec, replayed = self._ledger.reserve(
+                peer=peer, message_id=message_id, payload=params, context_id=context_id,
+                agent_slug=agent_slug, tenant=tenant, input_id=input_id)
+            with self._lock:
+                self._tasks[rec["task_id"]] = rec
+            return dict(rec), replayed
+        # Legacy in-memory stores (only direct construction in tests) retain
+        # admission semantics, but are not used by the network adapter.
+        digest = DurableTaskLedger.fingerprint(params, agent_slug, tenant, context_id)
+        with self._lock:
+            old = self._admissions.get((peer, message_id))
+            if old:
+                if old[1] != digest:
+                    raise IdempotencyConflict("messageId reused with different payload or scope")
+                return dict(self._tasks[old[0]]), True
+            task_id = new_task_id()
+            rec = {"task_id": task_id, "context_id": context_id, "peer": peer,
+                   "agent_slug": agent_slug, "tenant": tenant, "input_id": input_id,
+                   "state": STATE_SUBMITTED, "reply": "", "created_at": time.time(),
+                   "created_iso": now_iso(), "effect_state": "reserved",
+                   "push_url": "", "push_config_id": ""}
+            self._tasks[task_id] = rec
+            self._admissions[(peer, message_id)] = (task_id, digest)
+            return dict(rec), False
+
+    def claim_dispatch(self, task_id: str) -> bool:
+        """Persist uncertain-side-effects marker BEFORE external dispatch."""
+        if self._ledger:
+            rec = self._ledger.update(task_id, claim=True)
+            if rec is None:
+                return False
+            with self._lock:
+                self._tasks[task_id] = rec
+            return True
+        with self._lock:
+            rec = self._tasks.get(task_id)
+            if not rec or rec.get("effect_state") != "reserved":
+                return False
+            rec.update(effect_state="uncertain", state=STATE_WORKING)
+            return True
 
     @staticmethod
-    def _in_scope(rec: dict, agent_slug: str = "", tenant: str = "") -> bool:
-        return not ((agent_slug and rec.get("agent_slug", "") != agent_slug) or (tenant and rec.get("tenant", "") != tenant))
+    def _in_scope(rec: dict, agent_slug: str = "", tenant: str = "", peer: str = "") -> bool:
+        return not ((agent_slug and rec.get("agent_slug", "") != agent_slug)
+                    or (tenant and rec.get("tenant", "") != tenant)
+                    or (peer and rec.get("peer", "") != peer))
 
-    def _scoped(self, task_id: str, agent_slug: str = "", tenant: str = "") -> Optional[dict]:
+    def _scoped(self, task_id: str, agent_slug: str = "", tenant: str = "", peer: str = "") -> Optional[dict]:
         """Live record if visible in scope. Caller holds the lock."""
         rec = self._tasks.get(task_id)
-        return rec if rec and self._in_scope(rec, agent_slug, tenant) else None
+        return rec if rec and self._in_scope(rec, agent_slug, tenant, peer) else None
 
-    def _push_rec(self, task_id: str, config_id: str = "", agent_slug: str = "", tenant: str = "") -> Optional[dict]:
+    def _push_rec(self, task_id: str, config_id: str = "", agent_slug: str = "", tenant: str = "",
+                  peer: str = "") -> Optional[dict]:
         """Scoped record that has a push config (matching ``config_id`` if given). Caller holds the lock."""
-        rec = self._scoped(task_id, agent_slug, tenant)
+        rec = self._scoped(task_id, agent_slug, tenant, peer)
         if rec and rec.get("push_url") and (not config_id or rec.get("push_config_id") == config_id):
             return rec
         return None
@@ -339,51 +399,110 @@ class TaskStore:
         """``input_id``: the owner admission a forwarded task was sent as (empty for local tasks)."""
         rec = {"task_id": task_id, "context_id": context_id, "peer": peer, "agent_slug": agent_slug or "", "tenant": tenant or "",
                "input_id": input_id, "state": STATE_SUBMITTED, "reply": "", "created_at": time.time(), "created_iso": now_iso(), "push_url": "", "push_config_id": ""}
+        if self._ledger:
+            self._ledger.write_new(rec)
         with self._lock:
             self._tasks[task_id] = rec
         return dict(rec)
 
     def set_state(self, task_id: str, state: str) -> None:
+        if self._ledger:
+            rec = self._ledger.update(task_id, state=state)
+            if rec:
+                with self._lock:
+                    self._tasks[task_id] = rec
+            return
         with self._lock:
             if (rec := self._tasks.get(task_id)) and rec["state"] not in TERMINAL_STATES:
                 rec["state"] = state
 
-    def set_push_config(self, task_id: str, url: str, agent_slug: str = "", tenant: str = "") -> Optional[dict]:
+    def set_push_config(self, task_id: str, url: str, agent_slug: str = "", tenant: str = "",
+                        peer: str = "") -> Optional[dict]:
         """Attach a push notification config; returns the stored config or None."""
+        if self._ledger:
+            rec = self.get(task_id, agent_slug, tenant, peer)
+            if not rec:
+                return None
+            rec = self._ledger.update(task_id, push_url=url,
+                                      push_config_id="cfg-" + uuid.uuid4().hex[:12],
+                                      allow_terminal=True)
+            return self._push_config_view(rec) if rec else None
         with self._lock:
-            if not (rec := self._scoped(task_id, agent_slug, tenant)):
+            if not (rec := self._scoped(task_id, agent_slug, tenant, peer)):
                 return None
             rec["push_url"], rec["push_config_id"] = url, "cfg-" + uuid.uuid4().hex[:12]
             return self._push_config_view(rec)
 
-    def get_push_config(self, task_id: str, config_id: str = "", agent_slug: str = "", tenant: str = "") -> Optional[dict]:
+    def get_push_config(self, task_id: str, config_id: str = "", agent_slug: str = "", tenant: str = "",
+                        peer: str = "") -> Optional[dict]:
+        if self._ledger:
+            rec = self.get(task_id, agent_slug, tenant, peer)
+            return (self._push_config_view(rec) if rec and rec.get("push_url") and
+                    (not config_id or rec.get("push_config_id") == config_id) else None)
         with self._lock:
-            return self._push_config_view(rec) if (rec := self._push_rec(task_id, config_id, agent_slug, tenant)) else None
+            return self._push_config_view(rec) if (rec := self._push_rec(task_id, config_id, agent_slug, tenant, peer)) else None
 
-    def list_push_configs(self, task_id: str, agent_slug: str = "", tenant: str = "") -> list[dict]:
-        cfg = self.get_push_config(task_id, "", agent_slug, tenant)
+    def list_push_configs(self, task_id: str, agent_slug: str = "", tenant: str = "", peer: str = "") -> list[dict]:
+        cfg = self.get_push_config(task_id, "", agent_slug, tenant, peer)
         return [cfg] if cfg else []
 
-    def delete_push_config(self, task_id: str, config_id: str = "", agent_slug: str = "", tenant: str = "") -> bool:
+    def delete_push_config(self, task_id: str, config_id: str = "", agent_slug: str = "", tenant: str = "",
+                           peer: str = "") -> bool:
+        if self._ledger:
+            rec = self.get(task_id, agent_slug, tenant, peer)
+            if not rec or not rec.get("push_url") or (config_id and rec.get("push_config_id") != config_id):
+                return False
+            return self._ledger.update(task_id, push_url="", push_config_id="",
+                                       allow_terminal=True) is not None
         with self._lock:
-            rec = self._push_rec(task_id, config_id, agent_slug, tenant)
+            rec = self._push_rec(task_id, config_id, agent_slug, tenant, peer)
             if rec:
                 rec["push_url"] = rec["push_config_id"] = ""
             return rec is not None
 
     def pop_push_url(self, task_id: str) -> str:
+        if self._ledger:
+            return self._ledger.claim_push(task_id)
         with self._lock:
             rec = self._tasks.get(task_id)
             if rec:
                 url, rec["push_url"] = rec["push_url"], ""
             return url if rec else ""
 
-    def get(self, task_id: str, agent_slug: str = "", tenant: str = "") -> Optional[dict]:
+    def get(self, task_id: str, agent_slug: str = "", tenant: str = "", peer: str = "") -> Optional[dict]:
+        if self._ledger:
+            rec = self._ledger.get(task_id)
+            return dict(rec) if rec and self._in_scope(rec, agent_slug, tenant, peer) else None
         with self._lock:
-            return dict(rec) if (rec := self._scoped(task_id, agent_slug, tenant)) else None
+            return dict(rec) if (rec := self._scoped(task_id, agent_slug, tenant, peer)) else None
+
+    def get_by_message(self, peer: str, message_id: str, agent_slug: str = "",
+                       tenant: str = "") -> Optional[dict]:
+        """Recover by original trusted principal + messageId without resending."""
+        if not peer or not message_id:
+            return None
+        if self._ledger:
+            rec = self._ledger.get_by_message(peer, message_id)
+        else:
+            with self._lock:
+                match = self._admissions.get((peer, message_id))
+                rec = dict(self._tasks.get(match[0])) if match and match[0] in self._tasks else None
+        return dict(rec) if rec and self._in_scope(rec, agent_slug, tenant, peer) else None
 
     def complete(self, task_id: str, state: str, reply: str = "") -> Optional[dict]:
         """Transition a task to a terminal state. Idempotent."""
+        if self._ledger:
+            rec = self._ledger.update(task_id, state=state, reply=reply,
+                                      effect_state="settled", completed_at=time.time())
+            if rec is None:
+                return None
+            with self._lock:
+                self._tasks[task_id] = rec
+                watchers = self._watchers.pop(task_id, [])
+            for fut in watchers:
+                if not fut.done():
+                    fut.set_result((state, reply))
+            return dict(rec)
         with self._lock:
             rec = self._tasks.get(task_id)
             if not rec or rec["state"] in TERMINAL_STATES:
@@ -397,9 +516,10 @@ class TaskStore:
                 fut.set_result((state, reply))
         return out
 
-    def watch(self, task_id: str, agent_slug: str = "", tenant: str = "") -> Optional[Future]:
+    def watch(self, task_id: str, agent_slug: str = "", tenant: str = "", peer: str = "") -> Optional[Future]:
         with self._lock:
-            if not (rec := self._scoped(task_id, agent_slug, tenant)):
+            rec = (self._ledger.get(task_id) if self._ledger else self._scoped(task_id, agent_slug, tenant, peer))
+            if not rec or not self._in_scope(rec, agent_slug, tenant, peer):
                 return None
             fut: Future = Future()
             if rec["state"] in TERMINAL_STATES:
@@ -409,13 +529,14 @@ class TaskStore:
             return fut
 
     def list(self, context_id: str = "", state: str = "", page_size: int = 50, offset: int = 0,
-             agent_slug: str = "", tenant: str = "", with_total: bool = False):
+             agent_slug: str = "", tenant: str = "", with_total: bool = False, peer: str = ""):
         """Filtered task page (newest first) as ``(records, next_offset)``, or
         ``(records, next_offset, total)`` with ``with_total`` (v1.0 ListTasks totalSize)."""
         page_size = max(1, min(int(page_size or 50), 100))
         with self._lock:
-            recs = [dict(r) for r in reversed(self._tasks.values())
-                    if self._in_scope(r, agent_slug, tenant)
+            records = self._ledger.records() if self._ledger else list(self._tasks.values())
+            recs = [dict(r) for r in reversed(records)
+                    if self._in_scope(r, agent_slug, tenant, peer)
                     and (not context_id or r["context_id"] == context_id) and (not state or r["state"] == state)]
         total = len(recs)
         page = recs[offset:offset + page_size]
@@ -425,8 +546,11 @@ class TaskStore:
     def fail_orphans(self, timeout_seconds: float = 300, *, exclude: set[str] | None = None) -> list[str]:
         excluded = exclude or set()
         with self._lock:
-            stale = [tid for tid, rec in self._tasks.items()
-                     if tid not in excluded and rec["state"] not in TERMINAL_STATES
+            records = self._ledger.records() if self._ledger else list(self._tasks.values())
+            stale = [rec["task_id"] for rec in records
+                     if rec["task_id"] not in excluded and rec["state"] not in TERMINAL_STATES
+                     and rec["state"] != STATE_INPUT_REQUIRED
+                     and rec.get("effect_state") not in ("uncertain", "reserved")
                      and time.time() - rec["created_at"] > timeout_seconds]
         return [tid for tid in stale if self.complete(tid, STATE_FAILED, "[task orphaned — no reply produced]")]
 

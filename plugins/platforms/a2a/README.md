@@ -53,6 +53,44 @@ and push notification configs (inline or via
 memory — and the reply is returned over A2A. Completed tasks stay queryable
 via `tasks/get`.
 
+### Durable task admission and recovery
+
+- Incoming A2A `message.messageId` is required. A SQLite journal in the active
+  Hermes profile records each `(authenticated peer, messageId)` reservation
+  **before** dispatch; concurrent/restarted requests with the same payload and
+  scope receive the original `taskId`. Reuse with different payload or tenant
+  returns an idempotency conflict (`-32053`).
+- A second durable transaction marks dispatch **uncertain before** invoking a
+  gateway/owner. A `SIGKILL`, timeout, disconnected SSE client, or retry never
+  synthesizes a FAILED result or sends a second copy of uncertain work.
+- `configuration.returnImmediately: true` returns the committed task id without
+  waiting for inference; call `GetTask` or `SubscribeToTask` for settlement.
+  A late gateway reply updates the journal even if the original HTTP client
+  has disconnected. Terminal outcomes are immutable on subsequent retries.
+- `CancelTask` currently **rejects** active work (`-32002`) because no backend
+  stop acknowledgement exists. A `TASK_STATE_CANCELED` result must never be
+  fabricated while execution may still be running.
+- A dispatch claimed before a crash may remain `TASK_STATE_WORKING` until an
+  authoritative outcome is reconciled. **Do not automatically resubmit** such
+  work or mistake an unresolved task for failed work. Exactly-once external
+  effects require the actual backend's own idempotent admission/settlement.
+- For transports that lose the original `SendMessage` response, Hermes also
+  offers **`GetTaskByMessageId`**, a nonstandard read-only JSON-RPC extension:
+  `params: {"messageId": "original-id"}`. It returns the original v1.0 Task
+  only for the authenticated peer and routed agent/tenant. Rakazo uses this to
+  reconcile an uncertain send without issuing another `SendMessage`.
+
+Verification without live endpoints:
+
+```bash
+python tests/scripts/verify_native_a2a_peer_scope_stdlib.py
+python tests/scripts/verify_native_a2a_durable_stdlib.py
+```
+
+The latter executes the real native HTTP handler and SQLite ledger with a fake
+gateway, including multiprocess races and a real SIGKILL. It is **not** a live
+Chief↔Hermes↔Rakazo acceptance test.
+
 ## Security
 
 - **No token ⇒ localhost only.** The server binds `127.0.0.1` and refuses to
@@ -90,6 +128,7 @@ via `tasks/get`.
 | `A2A_RATE_LIMIT` | `60` | Requests/minute per identity. |
 | `A2A_MAX_PINGPONG_TURNS` | `5` | Anti-loop turn cap per context (max 20). |
 | `A2A_REPLY_TIMEOUT` | `300` | Seconds to wait for the agent's reply; the orphan sweep never fails a task before this window (floor 300s) or while a request still waits on it. |
+| `A2A_TASK_LEDGER_PATH` | `<profile HERMES_HOME>/a2a_native_tasks.sqlite3` | Per-profile SQLite WAL task/idempotency journal (owner-only file; synchronous FULL). Back it up with the profile. |
 | `A2A_PUSH_SECRET` | bearer token | HMAC secret for push signing. |
 | `A2A_ADVERTISED_TOOLSETS` | all registered | Restrict skills on the Agent Card. |
 

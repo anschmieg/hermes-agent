@@ -753,17 +753,35 @@ class TestTaskRpcHandlers:
         assert resp["error"]["code"] == protocol.ERR_TASK_NOT_FOUND
 
 
-    def test_tasks_cancel_resets_turns_for_context(self):
-        """Cancel must reset anti-loop turns for the task's CONTEXT (the old
-        code passed the task_id into a context-keyed map — silent no-op)."""
+    def test_tasks_cancel_fails_closed_without_backend_stop_receipt(self):
+        """An RPC cancel cannot attest termination of a still-running worker."""
         adapter = _bare_adapter()
         for _ in range(4):
             adapter._turns.track("ctx-loopy")
         adapter.tasks.create("task-c", "ctx-loopy", "peer")
         resp = adapter._rpc_tasks_cancel(1, {"taskId": "task-c"})
-        assert resp["result"]["status"]["state"] == "TASK_STATE_CANCELED"
-        # Turn counter went back to zero: next track() is turn 1.
-        assert adapter._turns.track("ctx-loopy") == 1
+        assert resp["error"]["code"] == protocol.ERR_TASK_NOT_CANCELABLE
+        assert adapter.tasks.get("task-c")["state"] == protocol.STATE_SUBMITTED
+        # Cancellation did not settle the task and must not reset its context.
+        assert adapter._turns.track("ctx-loopy") == 5
+
+    def test_task_and_push_operations_are_peer_scoped(self):
+        adapter = _bare_adapter()
+        adapter.tasks.create("task-alice", "ctx-shared", "alice")
+        adapter.tasks.set_state("task-alice", protocol.STATE_WORKING)
+        params = {"taskId": "task-alice"}
+        assert adapter._rpc_tasks_get(1, params, peer="alice")["result"]["id"] == "task-alice"
+        assert adapter._rpc_tasks_get(2, params, peer="bob")["error"]["code"] == protocol.ERR_TASK_NOT_FOUND
+        assert adapter._rpc_tasks_cancel(3, params, peer="bob")["error"]["code"] == protocol.ERR_TASK_NOT_FOUND
+        assert adapter._rpc_tasks_list(4, {"contextId": "ctx-shared"}, peer="bob")["result"]["tasks"] == []
+        assert adapter._rpc_tasks_list(5, {}, peer="alice")["result"]["totalSize"] == 1
+        push = {"taskId": "task-alice", "pushNotificationConfig": {"url": "https://example.com/cb"}}
+        assert adapter._rpc_push_config_create(6, push, peer="bob")["error"]["code"] == protocol.ERR_TASK_NOT_FOUND
+        assert adapter._rpc_push_config_create(7, push, peer="alice")["result"]["taskId"] == "task-alice"
+        assert adapter._rpc_push_config_get(8, params, peer="bob")["error"]["code"] == protocol.ERR_TASK_NOT_FOUND
+        assert adapter._rpc_push_config_list(9, params, peer="bob")["result"]["configs"] == []
+        assert adapter._rpc_push_config_delete(10, params, peer="bob")["error"]["code"] == protocol.ERR_TASK_NOT_FOUND
+        assert adapter._rpc_push_config_get(11, params, peer="alice")["result"]["taskId"] == "task-alice"
 
     def test_cancel_terminal_task_not_cancelable(self):
         adapter = _bare_adapter()
