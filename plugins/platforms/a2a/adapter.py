@@ -241,6 +241,10 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             return self._error(403, None, protocol.ERR_UNAUTHORIZED, refusal)
         try:
             length = int(self.headers.get("Content-Length", 0))
+            # Negative values make rfile.read(-1) consume until EOF, allowing
+            # one keep-alive request to tie up a thread with unbounded input.
+            if length < 0:
+                return self._error(400, None, protocol.ERR_PARSE, "invalid content length")
             if length > _MAX_BODY:
                 return self._error(413, None, protocol.ERR_PARSE, "payload too large")
             req = json.loads((self.rfile.read(length) if length else b"{}").decode("utf-8"))
