@@ -5,6 +5,9 @@ Requires an independently checked-out Rakazo tree containing
 No real credentials, gateway, database, or running server are contacted.
 
     python tests/scripts/verify_native_rakazo_cross_runtime.py /path/to/rakazo
+
+For isolated environments without pnpm on PATH, HERMES_A2A_NODE and
+HERMES_A2A_TSX_CLI may point to an existing Node binary and tsx CLI.
 """
 
 from __future__ import annotations
@@ -38,8 +41,15 @@ def main() -> int:
     })
     print("Hermes native A2A HTTP fixture on ephemeral loopback port", flush=True)
     try:
+        node = os.environ.get("HERMES_A2A_NODE")
+        tsx_cli = os.environ.get("HERMES_A2A_TSX_CLI")
+        if bool(node) != bool(tsx_cli):
+            print("Set both HERMES_A2A_NODE and HERMES_A2A_TSX_CLI, or neither",
+                  file=sys.stderr)
+            return 2
+        runner = [node, tsx_cli] if node else ["pnpm", "exec", "tsx"]
         result = subprocess.run(
-            ["pnpm", "exec", "tsx", "packages/adapters/src/a2a-native-hermes.e2e.ts"],
+            [*runner, "packages/adapters/src/a2a-native-hermes.e2e.ts"],
             cwd=rakazo, env=env, timeout=45, check=False,
         )
         print(f"RAKAZO_NATIVE_A2A_EXIT={result.returncode}", flush=True)
