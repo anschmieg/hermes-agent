@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import socket
 import time
 import urllib.parse
 from dataclasses import dataclass
@@ -251,6 +252,51 @@ def is_safe_callback_url(url: str, *, localhost_mode: Optional[bool] = None) -> 
     except ValueError:
         pass  # a hostname, not an IP
     return True
+
+
+def resolve_safe_callback_target(
+    url: str, *, localhost_mode: Optional[bool] = None
+) -> Optional[tuple[str, str, int, str, str]]:
+    """Validate ALL DNS answers and return an IP-pinned HTTP(S) callback target.
+
+    The caller MUST connect to the returned IP rather than resolving hostname
+    again. Checking a name before urllib.urlopen is insufficient: its second
+    lookup can rebind to a local service. The caller must also reject redirects.
+    Returns (scheme, original_hostname, port, validated_ip, request_target).
+    """
+    if localhost_mode is None:
+        localhost_mode = localhost_only()
+    if not is_safe_callback_url(url, localhost_mode=localhost_mode):
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.username is not None or parsed.password is not None or parsed.fragment:
+            return None
+        host = parsed.hostname
+        if not host:
+            return None
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        if not 1 <= port <= 65535:
+            return None
+        answers = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        allowed: list[str] = []
+        for family, _socktype, _proto, _canon, address in answers:
+            if family not in (socket.AF_INET, socket.AF_INET6):
+                return None
+            ip = ipaddress.ip_address(address[0])
+            if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+                ip = ip.ipv4_mapped
+            if not (ip.is_global or (localhost_mode and ip.is_loopback)):
+                return None
+            allowed.append(str(ip))
+        if not allowed:
+            return None
+        target = parsed.path or "/"
+        if parsed.query:
+            target += "?" + parsed.query
+        return parsed.scheme, host, port, allowed[0], target
+    except (OSError, ValueError, TypeError):
+        return None
 
 
 def audit(direction: str, peer: str, task_id: str, summary: str) -> None:
