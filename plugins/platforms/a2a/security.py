@@ -1,6 +1,6 @@
 """A2A security primitives (adapter + client tools). A2A is a *network* surface: bind safety (no
 token => 127.0.0.1 only); peer identity from credentials, never the body (A2A_PEER_TOKENS
-token->name, shared A2A_BEARER_TOKEN => ip:<addr>); inbound injection filtering; outbound
+token->name, shared A2A_BEARER_TOKEN => one undifferentiated principal); inbound injection filtering; outbound
 credential redaction; JSONL audit; trusted-peer allow-list; HMAC push signing; SSRF-safe URLs."""
 
 from __future__ import annotations
@@ -91,7 +91,13 @@ class A2ASecurityContext:
 
     def authenticate(self, auth_header: Optional[str], client_ip: str = "") -> Optional[str]:
         """Peer identity or None (401). Localhost-only: ``ip:<addr>``; per-peer token: that
-        peer's name; shared token: ``ip:<addr>``. Constant-time comparisons."""
+        peer's name; shared bearer: one shared principal. Constant-time comparisons.
+
+        Client source IP is not an identity for a shared credential: reverse proxies
+        collapse unrelated clients to one IP and reconnections may change it. A
+        multi-peer deployment MUST configure distinct A2A_PEER_TOKENS; a shared
+        bearer authenticates just one undifferentiated trust domain.
+        """
         if self.localhost_only():
             return f"ip:{client_ip or 'local'}"
         parts = (auth_header or "").split(None, 1)
@@ -102,7 +108,7 @@ class A2ASecurityContext:
             if hmac.compare_digest(presented, token):
                 return name
         if self.bearer_token and hmac.compare_digest(presented, self.bearer_token):
-            return f"ip:{client_ip or 'unknown'}"
+            return "bearer:shared"
         return None
 
     def is_loopback_bind(self) -> bool:
