@@ -9,7 +9,7 @@ gateway dependencies replaced by test shims. No live endpoint or credentials.
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
@@ -266,6 +266,22 @@ class NativeHttpAcceptance(unittest.TestCase):
             self.assertEqual(self.count, 1)
         finally:
             native._reply_timeout = previous
+
+    def test_disconnected_sse_keepalive_never_marks_backend_failed(self):
+        prior = native._SSE_KEEPALIVE
+        native._SSE_KEEPALIVE = .01
+        try:
+            callback_attempts = []
+            def client_disconnected():
+                callback_attempts.append(True)
+                raise BrokenPipeError("client disconnected")
+            state, _ = native.A2AAdapter._await_future(
+                Future(), time.time() + 2, client_disconnected,
+                (protocol.STATE_WORKING, "unverified"))
+            self.assertEqual(state, protocol.STATE_WORKING)
+            self.assertEqual(len(callback_attempts), 1)
+        finally:
+            native._SSE_KEEPALIVE = prior
 
     def test_conflicting_http_retry_rejected_without_second_dispatch(self):
         original_timeout = native._reply_timeout

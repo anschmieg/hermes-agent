@@ -739,7 +739,10 @@ class A2AAdapter(BasePlatformAdapter):
                     try:
                         keepalive()
                     except Exception:
-                        return (protocol.STATE_FAILED, "[client disconnected]")
+                        # A disconnected SSE client does not cancel accepted
+                        # backend work. The authoritative task stays WORKING
+                        # until an actual callback or owner receipt settles it.
+                        return (protocol.STATE_WORKING, "[stream disconnected; backend outcome unverified]")
             except Exception:
                 return on_timeout
 
