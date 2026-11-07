@@ -57,7 +57,7 @@ class PeerContextIsolation(NativeHttpAcceptance):
         orig_source = self.adapter.build_source
         self.adapter.build_source = lambda **kw: (sources.append(kw), orig_source(**kw))[1]
         self.adapter._agents["dev"] = {"slug": "dev", "tenant": "dev", "path": "/dev",
-                                       "local": True, "name": "dev"}
+                                       "local": True, "name": "dev", "allowed_peers": {"alice"}}
         for tenant, msg_id in (("", "same-root"), ("dev", "same-dev")):
             params = self.message(msg_id)
             params["message"]["contextId"] = "same-context"
@@ -69,6 +69,20 @@ class PeerContextIsolation(NativeHttpAcceptance):
         self.assertEqual(len(sources), 2)
         self.assertNotEqual(sources[0]["chat_id"], sources[1]["chat_id"],
                             "separate served tenants must never share Hermes session")
+
+    def test_foreign_peer_cannot_route_into_another_tenant(self):
+        import urllib.error
+        self.adapter._agents["dev"] = {"slug": "dev", "tenant": "dev", "path": "/dev",
+                                       "local": True, "name": "dev", "allowed_peers": {"bob"}}
+        params = self.message("tenant-bypass")
+        params["tenant"] = "dev"
+        params["configuration"] = {"returnImmediately": True}
+        with self.assertRaises(urllib.error.HTTPError) as err:
+            self.post("SendMessage", params, peer="alice")
+        self.assertEqual(err.exception.code, 403)
+        self.assertEqual(self.count, 0)
+        permitted = self.post("SendMessage", params, peer="bob")["result"]["task"]
+        self.assertEqual(permitted["contextId"] != "", True)
 
 
 class BearerPrincipalIsolation(unittest.TestCase):
