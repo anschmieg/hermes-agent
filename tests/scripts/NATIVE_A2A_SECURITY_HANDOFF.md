@@ -29,3 +29,13 @@ Executed **locally in isolated ChatCodex checkout**, against the real adapter, l
 - No merge/deploy without explicit operator approval.
 
 Coordinator should read this note as an evidence checkpoint, not a production GO.
+
+## 2026-11-07 23:24 CET — independent next gate (owner run)
+
+**Hermes owner code/test HEAD:** `9b65eb8834fdfe953ca3074e76d8332601dc2fa6` before this handoff-note commit. This feature includes HTTP negative Content-Length rejection, and portable cross-runtime test harness; the cross-tenant context/session isolation patch at `3a1996c` remains intact.
+
+- **Actual TypeScript client ↔ native Hermes HTTP PASS (exit 0)** using *current feature-branch Hermes* adapter/security/ledger/protocol mirrored into a dedicated ChatCodex checkout, and Rakazo's real `packages/adapters/src/a2a-native-hermes.e2e.ts` / `A2AClient` from `anschmieg/rakazo-a2a-handoff` feature/native-a2a-bots-spike (baseline `f44a15c`), Node 24 + tsx. The Python runner `tests/scripts/verify_native_rakazo_cross_runtime.py` launches the real native HTTP fixture on an ephemeral loopback port with fake inference. Output `RAKAZO↔HERMES NATIVE HTTP E2E PASS`; `CROSS_RUNTIME_EXIT=0`. Script supports `HERMES_A2A_NODE` and `HERMES_A2A_TSX_CLI` when pnpm is unavailable. Real code paths checked: SendMessage, duplicate idempotency, GetTask, GetTaskByMessageId, Bob forbidden, mutated retry rejected, final ACK.
+- **New HTTP framing flaw:** Negative `Content-Length` passed into `rfile.read(-1)`, potentially blocking a persistent HTTP worker and reading unbounded body. Adapter now rejects it with HTTP 400 *before* reading any body. `tests/scripts/verify_native_a2a_http_framing.py` verifies `-1`, `-1024`, >1MB, normal JSON-RPC, and no task admitted for malformed frames.
+- **Retested isolated native real-code suites:** framing **3 passed**, context/security **20 passed**, durable crash/recovery **15 passed** including real SIGKILL and process races, peer scope **4 passed**. Compilation and `git diff --check` both exit 0. Counts are distinct; not mock-only production acceptance. No real credentials, production requests, replay of uncertain tasks, merge or deployment.
+
+**NO-GO until:** live authorized Chief/Rakazo end-to-end persisted Bot→Thread→Run acceptance, real disposable PostgreSQL ExternalEffect/lease-fencing negative proof, backend-confirmed stop for cancel, credentials and routed ACL validation at deployment, and independent review/CI against this SHA. Cross-runtime integration proves the real TS HTTP client, not production Chief inference. Coordinator notification action returned 404; this checked-in note is the durable handoff for coordinator consumption.
