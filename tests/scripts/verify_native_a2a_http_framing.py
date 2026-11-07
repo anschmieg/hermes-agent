@@ -9,13 +9,14 @@ import json
 import unittest
 from urllib.parse import urlsplit
 
-from verify_native_a2a_durable_stdlib import NativeHttpAcceptance
+import verify_native_a2a_durable_stdlib as native_fixture
 
 
 class NativeHttpFraming(unittest.TestCase):
     def setUp(self):
-        fixture = NativeHttpAcceptance("test_return_immediately_persists_task_then_late_reply")
+        fixture = native_fixture.NativeHttpAcceptance("test_return_immediately_persists_task_then_late_reply")
         fixture.setUp()
+        self.fixture = fixture
         self.addCleanup(fixture.doCleanups)
         url = urlsplit(fixture.base)
         self.host, self.port = url.hostname, url.port
@@ -37,11 +38,13 @@ class NativeHttpFraming(unittest.TestCase):
                 status, body = self.request_with_length(malformed)
                 self.assertEqual(status, 400)
                 self.assertEqual(body["error"]["code"], -32700)
+        self.assertEqual(self.fixture.adapter.tasks.list()[0], [])
 
     def test_oversized_content_length_rejected_without_read(self):
         status, body = self.request_with_length("1048577")
         self.assertEqual(status, 413)
         self.assertEqual(body["error"]["code"], -32700)
+        self.assertEqual(self.fixture.adapter.tasks.list()[0], [])
 
     def test_valid_jsonrpc_content_length_still_works(self):
         conn = http.client.HTTPConnection(self.host, self.port, timeout=2.0)
