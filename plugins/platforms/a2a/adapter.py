@@ -261,6 +261,8 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             (lambda: route.get("error"), 400, protocol.ERR_INVALID_PARAMS, route.get("error")),
             (lambda: not adapter._rate_limiter.allow(identity), 429, protocol.ERR_RATE_LIMITED, "rate limit exceeded"),
             (lambda: not adapter._security_context.is_trusted_peer(identity), 403, protocol.ERR_UNTRUSTED_PEER, f"peer '{identity}' not trusted"),
+            (lambda: not adapter._agent_allows_peer(route.get("agent") or {}, identity), 403,
+             protocol.ERR_UNTRUSTED_PEER, "peer is not authorized for the requested served agent"),
             (lambda: not handler_name, 200, protocol.ERR_METHOD_NOT_FOUND, f"method not found: {method}"),
         )
         for failed, http, code, msg in checks:
@@ -438,6 +440,12 @@ class A2AAdapter(BasePlatformAdapter):
             if isinstance(toolsets, str):
                 toolsets = [t.strip() for t in toolsets.split(",") if t.strip()]
             tenant = str(val.get("tenant") or slug).strip()
+            allowed = val.get("allowed_peers")
+            if isinstance(allowed, str):
+                allowed = [p.strip() for p in allowed.split(",") if p.strip()]
+            if allowed is not None and not isinstance(allowed, (list, tuple, set)):
+                logger.warning("A2A: ignoring invalid allowed_peers for served agent %r", slug)
+                continue
             if tenant:
                 if tenant in tenants:
                     logger.warning("A2A: ignoring served agent %r with duplicate tenant %r already used by %r",
@@ -450,6 +458,8 @@ class A2AAdapter(BasePlatformAdapter):
                 "name": str(val.get("name") or f"Hermes {slug}"),
                 "description": str(val.get("description") or f"Hermes profile '{profile or slug}' exposed over A2A."),
                 "advertised_toolsets": list(toolsets or []),
+                # Explicit ACL required for remotely exposed non-root tenants.
+                "allowed_peers": frozenset(str(p).strip() for p in allowed if str(p).strip()) if allowed is not None else None,
                 "timeout": int(val.get("timeout") or _reply_timeout()),
             }
         return agents
@@ -569,6 +579,21 @@ class A2AAdapter(BasePlatformAdapter):
 
     def _scope_for_agent(self, agent: Optional[dict]) -> tuple[str, str]:
         return tuple(str((agent or self._agents[""]).get(k) or "") for k in ("slug", "tenant"))
+
+    def _agent_allows_peer(self, agent: dict, peer: str) -> bool:
+        """A routed tenant is NOT itself proof that this credential may access it.
+
+        In remote mode a non-root agent needs a per-agent allow-list, unless the
+        operator explicitly opted into A2A_ALLOW_ALL_USERS. The localhost-only
+        listener remains an intentionally single-machine trust domain.
+        """
+        if not agent.get("slug"):
+            return True
+        sec = self._security_context
+        if sec.localhost_only() or getattr(sec, "allow_all_users", False):
+            return True
+        allowed = agent.get("allowed_peers")
+        return allowed is not None and peer in allowed
 
     @staticmethod
     def _execution_context_id(agent: dict, peer: str, external_context_id: str) -> str:
