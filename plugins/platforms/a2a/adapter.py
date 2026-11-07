@@ -361,6 +361,9 @@ class A2AAdapter(BasePlatformAdapter):
         if sec.dispatch_fails_closed():
             logger.error("A2A: exposed on non-loopback bind %s with no A2A_TRUSTED_PEERS; every dispatch will be refused (403). "
                          "Set A2A_TRUSTED_PEERS, or A2A_ALLOW_ALL_USERS=true for a trusted network.", self.host)
+        if sec.bearer_token and not sec.peer_tokens:
+            logger.warning("A2A: A2A_BEARER_TOKEN authenticates all callers as one shared principal; "
+                           "configure unique A2A_PEER_TOKENS for independently isolated remote peers")
         self._wire_plugin_handlers(None)  # plugin-registered native handlers
         return True
 
@@ -567,6 +570,20 @@ class A2AAdapter(BasePlatformAdapter):
     def _scope_for_agent(self, agent: Optional[dict]) -> tuple[str, str]:
         return tuple(str((agent or self._agents[""]).get(k) or "") for k in ("slug", "tenant"))
 
+    @staticmethod
+    def _execution_context_id(agent: dict, peer: str, external_context_id: str) -> str:
+        """Private gateway/session/history key; the caller's contextId is never a local chat id.
+
+        A2A contextIds are chosen by remote callers, so two peers (or served tenants)
+        may legitimately submit the same string. Using that string as a Hermes
+        chat_id would merge their gateway sessions, pending callbacks and JSONL
+        histories. Keep it public in Task receipts but never as a local state key.
+        The full identity tuple makes the same peer's conversation stable on restart.
+        """
+        scope = "\0".join((str(agent.get("slug") or ""), str(agent.get("tenant") or ""),
+                            str(peer), str(external_context_id)))
+        return "a2a-session-" + hashlib.sha256(scope.encode("utf-8")).hexdigest()
+
     def _end_task(self, rec: dict, state: str, text: str, stored_reply: Optional[str] = None) -> tuple[dict, None]:
         """Complete a task immediately (rejected / not ready) and build its terminal Task."""
         # Store the explanatory result too: an exact HTTP retry after a crash
@@ -589,6 +606,7 @@ class A2AAdapter(BasePlatformAdapter):
             # A retry of a first send repeats the messageId and omits the contextId it never received.
             scope = "\0".join((*self._scope_for_agent(agent), peer))
             context_id = protocol.message_context_id(scope, message_id)
+        execution_context_id = self._execution_context_id(agent, peer, context_id)
         # The exact durable owner input identity is stable across process restarts.
         scope = "\0".join((*self._scope_for_agent(agent), peer, context_id, message_id))
         input_id = "a2a-msg:" + hashlib.sha256(scope.encode()).hexdigest()
@@ -601,7 +619,7 @@ class A2AAdapter(BasePlatformAdapter):
             return protocol.TaskStore.to_task(self.tasks.get(task_id) or rec), None
         # A replay of a never-dispatched reservation can safely claim the work.
         # It is not a new turn against the ping-pong budget.
-        turn = 0 if retry else self._turns.track(context_id)
+        turn = 0 if retry else self._turns.track(execution_context_id)
         max_turns = protocol.max_pingpong_turns()
         if turn > max_turns:
             protocol.metrics.anti_loop_triggers += 1
@@ -616,8 +634,8 @@ class A2AAdapter(BasePlatformAdapter):
             return protocol.TaskStore.to_task(self.tasks.get(task_id) or rec), None
         framed = security.wrap_inbound(peer, text)
         security.audit("inbound", peer, task_id, text)
-        if not protocol.logged_input(context_id, input_id):
-            protocol.persist_message(context_id, "user", text, task_id, input_id=input_id or "")
+        if not protocol.logged_input(execution_context_id, input_id):
+            protocol.persist_message(execution_context_id, "user", text, task_id, input_id=input_id or "")
             protocol.metrics.inbound_total += 1
         self._register_inline_push(task_id, params, agent=agent)
         if forwarded:
@@ -630,7 +648,7 @@ class A2AAdapter(BasePlatformAdapter):
                 def settle_forward() -> None:
                     try:
                         reply, state = self._forward_to_profile(
-                            agent, peer, context_id, framed, input_id=input_id)
+                            agent, peer, execution_context_id, framed, input_id=input_id)
                         if state != protocol.STATE_WORKING:
                             self._record_outcome(task_id, context_id, peer, state, reply)
                     except Exception:
@@ -640,15 +658,15 @@ class A2AAdapter(BasePlatformAdapter):
                 threading.Thread(target=settle_forward, name="a2a-forward", daemon=True).start()
                 return protocol.TaskStore.to_task(self.tasks.get(task_id) or rec), None
             try:
-                reply, state = self._forward_to_profile(agent, peer, context_id, framed, input_id=input_id or task_id)
+                reply, state = self._forward_to_profile(agent, peer, execution_context_id, framed, input_id=input_id or task_id)
                 if state != protocol.STATE_WORKING:
                     self._record_outcome(task_id, context_id, peer, state, reply)
                 return protocol.build_task(task_id, context_id, state, reply, created_at=rec["created_iso"]), None
             finally:
                 self._pop_pending(task_id)
-        fut = self._add_pending(task_id, context_id)
+        fut = self._add_pending(task_id, execution_context_id)
         event = MessageEvent(text=framed, message_type=MessageType.TEXT, message_id=task_id,
-                             source=self.build_source(chat_id=context_id, chat_name=f"a2a:{peer}", chat_type="dm", user_id=peer, user_name=peer))
+                             source=self.build_source(chat_id=execution_context_id, chat_name=f"a2a:{peer}", chat_type="dm", user_id=peer, user_name=peer))
         try:
             asyncio.run_coroutine_threadsafe(self.handle_message(event), self._loop)
         except Exception:
@@ -698,7 +716,12 @@ class A2AAdapter(BasePlatformAdapter):
         # Commit first; duplicate outcomes must not duplicate audit, log or push.
         if self.tasks.complete(task_id, state, reply) is None:
             return False
-        protocol.persist_message(context_id, "agent", reply, task_id)
+        rec = self.tasks.get(task_id)
+        if rec:
+            session_id = self._execution_context_id(
+                {"slug": rec.get("agent_slug", ""), "tenant": rec.get("tenant", "")},
+                rec.get("peer", peer), rec["context_id"])
+            protocol.persist_message(session_id, "agent", reply, task_id)
         security.audit("outbound", peer, task_id, reply)
         m = protocol.metrics
         if state in (protocol.STATE_COMPLETED, protocol.STATE_INPUT_REQUIRED):
@@ -971,7 +994,7 @@ class A2AAdapter(BasePlatformAdapter):
                 rec = self.tasks.get(task_id)
                 if rec:
                     try:
-                        await asyncio.to_thread(self._record_outcome, task_id, chat_id,
+                        await asyncio.to_thread(self._record_outcome, task_id, rec["context_id"],
                                                 rec["peer"], protocol.STATE_COMPLETED, content or "")
                     finally:
                         self._pop_pending(task_id)
