@@ -359,7 +359,8 @@ class NativeHttpAcceptance(unittest.TestCase):
 
     def test_forwarded_owner_return_immediately_claims_once(self):
         self.adapter._agents["dev"] = {"slug": "dev", "tenant": "dev", "path": "/dev",
-                                      "local": False, "profile": "dev", "name": "dev"}
+                                      "local": False, "profile": "dev", "name": "dev",
+                                      "allowed_peers": {"alice"}}
         calls = []
         def owner(agent, peer, context_id, framed, *, input_id):
             calls.append(input_id)
