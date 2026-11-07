@@ -5,7 +5,9 @@ python tests/scripts/verify_native_a2a_push_egress.py
 from __future__ import annotations
 
 import socket
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from unittest import mock
 
@@ -16,9 +18,9 @@ from plugins.platforms.a2a.adapter import A2AAdapter
 
 
 class PushEgressSafety(unittest.TestCase):
-    def _send(self, url: str):
+    def _send(self, url: str, *, localhost_mode: bool = False):
         tasks = SimpleNamespace(pop_push_url=lambda _id: url)
-        ctx = SimpleNamespace(localhost_only=lambda: False, sign_push_payload=lambda _: "")
+        ctx = SimpleNamespace(localhost_only=lambda: localhost_mode, sign_push_payload=lambda _: "")
         adapter = SimpleNamespace(tasks=tasks, _security_context=ctx)
         return A2AAdapter._send_push_notification(adapter, "t1", "ctx1", "done", "TASK_STATE_COMPLETED")
 
@@ -82,7 +84,63 @@ class PushEgressSafety(unittest.TestCase):
         self.assertIsNone(security.resolve_safe_callback_target(
             "https://user:secret@public.example.test/hook", localhost_mode=False))
 
+    def test_real_ephemeral_loopback_http_delivery(self):
+        """Exercise the pinned transport itself, not just http.client mocks."""
+        delivered = []
+
+        class Hook(BaseHTTPRequestHandler):
+            def do_POST(self):
+                size = int(self.headers.get("Content-Length") or 0)
+                delivered.append((self.path, self.rfile.read(size), self.headers.get("Host")))
+                self.send_response(204)
+                self.end_headers()
+
+            def log_message(self, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Hook)
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            self._send(f"http://127.0.0.1:{server.server_port}/receive?x=1", localhost_mode=True)
+            self.assertEqual(len(delivered), 1)
+            self.assertEqual(delivered[0][0], "/receive?x=1")
+            self.assertIn(b"t1", delivered[0][1])
+            self.assertEqual(delivered[0][2], f"127.0.0.1:{server.server_port}")
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=3)
+
+    def test_real_http_redirect_does_not_trigger_second_request(self):
+        called = []
+
+        class Hook(BaseHTTPRequestHandler):
+            def do_POST(self):
+                called.append(self.path)
+                self.send_response(302)
+                self.send_header("Location", "/must-not-follow")
+                self.end_headers()
+
+            def do_GET(self):
+                called.append("UNSAFE_REDIRECT")
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Hook)
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            self._send(f"http://127.0.0.1:{server.server_port}/source", localhost_mode=True)
+            self.assertEqual(called, ["/source"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=3)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
-
