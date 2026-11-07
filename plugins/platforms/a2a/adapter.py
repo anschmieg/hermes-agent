@@ -8,15 +8,16 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import http.client
 import json
 import logging
 import os
 import re
 import socket
+import ssl
 import threading
 import time
 import urllib.parse
-import urllib.request
 from collections import OrderedDict, deque
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FuturesTimeout
@@ -994,18 +995,35 @@ class A2AAdapter(BasePlatformAdapter):
         callback_url = self.tasks.pop_push_url(task_id)
         if not callback_url:
             return
-        if not security.is_safe_callback_url(callback_url, localhost_mode=self._security_context.localhost_only()):
-            return fail("blocked — unsafe callback URL: %s", callback_url)
+        endpoint = security.resolve_safe_callback_target(
+            callback_url, localhost_mode=self._security_context.localhost_only())
+        if endpoint is None:
+            return fail("blocked — unsafe callback destination")
         payload = protocol.status_update(task_id, context_id, state, (reply or "")[:2000])
         headers = {"Content-Type": "application/json"}
         if signature := self._security_context.sign_push_payload(payload):
             headers["X-A2A-Signature"] = signature
+        scheme, hostname, port, approved_ip, request_target = endpoint
+        # Connect to the vetted IP. urllib.urlopen would resolve the hostname
+        # AGAIN (DNS-rebinding SSRF), honor untrusted proxy settings and follow
+        # redirects to private addresses. http.client does none of those.
+        display_host = f"[{hostname}]" if ":" in hostname else hostname
+        headers["Host"] = display_host + (f":{port}" if port != (443 if scheme == "https" else 80) else "")
+        connection = (http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection)(
+            hostname, port, timeout=10)
         try:
-            req = urllib.request.Request(callback_url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                status = resp.status
+            connection.sock = socket.create_connection((approved_ip, port), timeout=10)
+            if scheme == "https":
+                # Keep verification and SNI tied to the ORIGINAL authenticated
+                # DNS name, not to the resolved address used on the wire.
+                connection.sock = ssl.create_default_context().wrap_socket(
+                    connection.sock, server_hostname=hostname)
+            connection.request("POST", request_target, json.dumps(payload).encode("utf-8"), headers=headers)
+            status = connection.getresponse().status
         except Exception as e:
             return fail("failed: %s", e)
+        finally:
+            connection.close()
         if not 200 <= status < 300:
             return fail("got HTTP %d", status)
         protocol.metrics.push_sent += 1
