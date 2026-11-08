@@ -624,7 +624,13 @@ class A2AAdapter(BasePlatformAdapter):
         """Complete a task immediately (rejected / not ready) and build its terminal Task."""
         # Store the explanatory result too: an exact HTTP retry after a crash
         # must receive the same rejection reason as the first attempt.
-        self.tasks.complete(rec["task_id"], state, text if stored_reply is None else stored_reply)
+        # A concurrent duplicate HTTP admission may already have claimed this
+        # reservation for backend dispatch. Never overwrite its uncertain
+        # WORKING state with a pre-dispatch validation rejection.
+        if self.tasks.complete(rec["task_id"], state, text if stored_reply is None else stored_reply,
+                               require_reserved=True) is None:
+            authoritative = self.tasks.get(rec["task_id"])
+            return protocol.TaskStore.to_task(authoritative or rec), None
         protocol.metrics.tasks_failed += state == protocol.STATE_FAILED
         return protocol.build_task(rec["task_id"], rec["context_id"], state, text, created_at=rec["created_iso"]), None
 
