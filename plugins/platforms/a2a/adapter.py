@@ -219,18 +219,19 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         agent = route["agent"]
         subpath = route["subpath"].rstrip("/") or "/"
         public_url = self._request_public_url() or None
+        sec = adapter._security_context
+        identity = sec.authenticate(self.headers.get("Authorization"), self._client_ip())
+        authorized = sec.localhost_only() or (identity is not None and sec.is_trusted_peer(identity))
+        # Do not disclose a routed private agent's card, metrics, or existence
+        # before checking the same credential and per-agent ACL as /health.
+        # Root discovery remains public for clients bootstrapping A2A auth.
+        if agent.get("slug") and (not authorized or not adapter._agent_allows_peer(agent, identity or "")):
+            return self._json(404, {"error": "not found"})
         if subpath in ("/.well-known/agent.json", "/.well-known/agent-card.json"):
             return self._json(200, adapter._build_card(public_url, agent=agent))
         if subpath == "/metrics":
             return self._json(200, protocol.metrics.snapshot())
         if subpath not in ("/", "/health"):
-            return self._json(404, {"error": "not found"})
-        sec = adapter._security_context
-        identity = sec.authenticate(self.headers.get("Authorization"), self._client_ip())
-        authorized = sec.localhost_only() or (identity is not None and sec.is_trusted_peer(identity))
-        # A private routed agent's name must not leak through /health. A globally
-        # valid bearer token does not authorize enumeration of private served agents.
-        if agent.get("slug") and (not authorized or not adapter._agent_allows_peer(agent, identity or "")):
             return self._json(404, {"error": "not found"})
         payload = {"status": "ok", "agent": agent.get("name") or adapter.agent_name}
         if authorized:

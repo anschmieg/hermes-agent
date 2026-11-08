@@ -20,6 +20,38 @@ from plugins.platforms.a2a import adapter as native, protocol
 
 
 class CrossWorkerSubscriptionAndHealth(NativeHttpAcceptance):
+    def test_private_agent_cards_require_authenticated_peer_acl(self):
+        """Both discovery aliases must hide private routed-agent metadata."""
+        self.adapter._agents["dev"] = {
+            "slug": "dev", "tenant": "confidential-tenant", "path": "/dev",
+            "profile": "secret-internal-profile", "name": "private-agent",
+            "description": "private description", "local": False,
+            "allowed_peers": {"alice"}, "advertised_toolsets": [],
+        }
+
+        def get(path: str, peer: str | None):
+            headers = {"Authorization": f"Bearer {peer}-token"} if peer else {}
+            request = urllib.request.Request(self.base.rstrip("/") + path, headers=headers)
+            with urllib.request.urlopen(request, timeout=6) as response:
+                return response.status, json.load(response)
+
+        for suffix in ("/.well-known/agent.json", "/.well-known/agent-card.json"):
+            with self.subTest(suffix=suffix):
+                for peer in (None, "bob"):
+                    with self.subTest(peer=peer):
+                        with self.assertRaises(urllib.error.HTTPError) as denied:
+                            get("/dev" + suffix, peer)
+                        self.assertEqual(denied.exception.code, 404)
+                        self.assertNotIn("private-agent", denied.exception.read().decode())
+                status, authorized_card = get("/dev" + suffix, "alice")
+                self.assertEqual(status, 200)
+                self.assertEqual(authorized_card["name"], "private-agent")
+                self.assertEqual(authorized_card["supportedInterfaces"][0]["tenant"], "confidential-tenant")
+                # The default/root agent remains discoverable without credentials.
+                status, public_card = get(suffix, None)
+                self.assertEqual(status, 200)
+                self.assertEqual(public_card["name"], "hermes-test")
+
     def test_external_process_completion_wakes_subscribed_http_client(self):
         prior_timeout = native._reply_timeout
         prior_handler = self.adapter.handle_message
@@ -139,6 +171,7 @@ if __name__ == "__main__":
     # The base fixture intentionally contains its own older tests; run only
     # these new adversarial cases, not the inherited suite a second time.
     names = (
+        "test_private_agent_cards_require_authenticated_peer_acl",
         "test_external_process_completion_wakes_subscribed_http_client",
         "test_remote_settlement_never_crosses_peer_or_tenant",
         "test_health_never_exposes_unapproved_agent_or_internal_profile",
