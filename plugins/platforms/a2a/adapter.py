@@ -581,11 +581,27 @@ class A2AAdapter(BasePlatformAdapter):
         with self._pending_lock:
             return self._resolve_locked(task_id, state, text)
 
-    def _resolve_oldest_for_context(self, context_id: str, state: str, text: str) -> bool:
+    def _resolve_oldest_for_context(self, context_id: str, state: str, text: str,
+                                    *, reply_to: Optional[str] = None) -> Optional[str]:
+        """Resolve the exact inbound task, never a different task's late reply.
+
+        The gateway carries MessageEvent.message_id back as ``reply_to`` on a
+        final send.  An old/canceled task may reply after a newer task began in
+        the same context; FIFO would irrevocably complete the newer task with
+        the stale result.  Legacy unkeyed sends are safe only with *one*
+        unresolved task in the context.  Ambiguity must fail closed.
+        """
         with self._pending_lock:
-            for tid in self._pending_order.get(context_id, ()):
-                if self._resolve_locked(tid, state, text):
-                    return tid
+            if reply_to is not None:
+                task_id = str(reply_to)
+                pending = self._pending.get(task_id)
+                if pending and pending[0] == context_id and self._resolve_locked(task_id, state, text):
+                    return task_id
+                return None
+            unresolved = [tid for tid in self._pending_order.get(context_id, ())
+                          if tid in self._pending and not self._pending[tid][1].done()]
+            if len(unresolved) == 1 and self._resolve_locked(unresolved[0], state, text):
+                return unresolved[0]
             return None
 
     def _scope_for_agent(self, agent: Optional[dict]) -> tuple[str, str]:
@@ -1086,13 +1102,15 @@ class A2AAdapter(BasePlatformAdapter):
         logger.debug("A2A: push notification sent for task %s", task_id)
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None):
-        """Fulfil the oldest pending reply Future for this context (``chat_id`` = A2A context id).
+        """Fulfil the task identified by ``reply_to`` (``chat_id`` = private A2A session key).
         Only sends carrying ``metadata['notify']`` (the base adapter's final-reply marker) satisfy
-        the caller; progress/status/preview sends must not."""
+        the caller; progress/status/preview sends must not. Unkeyed sends can
+        settle only a single unambiguous pending task."""
         if not (metadata or {}).get("notify"):
             logger.debug("A2A: ignoring non-final send for context %s", chat_id)
         else:
-            task_id = self._resolve_oldest_for_context(chat_id, protocol.STATE_COMPLETED, content or "")
+            task_id = self._resolve_oldest_for_context(
+                chat_id, protocol.STATE_COMPLETED, content or "", reply_to=reply_to)
             if task_id:
                 rec = self.tasks.get(task_id)
                 if rec:
@@ -1102,7 +1120,8 @@ class A2AAdapter(BasePlatformAdapter):
                     finally:
                         self._pop_pending(task_id)
             else:
-                logger.debug("A2A: send() for context %s had no pending waiter", chat_id)
+                logger.debug("A2A: ignored uncorrelated final send for context %s (reply_to=%s)",
+                             chat_id, reply_to)
         return SendResult(success=True, message_id=str(int(time.time() * 1000)))
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
