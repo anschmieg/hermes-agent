@@ -316,11 +316,15 @@ class NativeHttpAcceptance(unittest.TestCase):
 
     def test_sse_timeout_stays_working_then_subscribe_shows_settlement(self):
         original_timeout = native._reply_timeout
+        original_keepalive = native._SSE_KEEPALIVE
         native._reply_timeout = lambda: .03
+        native._SSE_KEEPALIVE = .01
         try:
             stream = self.stream("SendStreamingMessage", self.message("stream-one"))
             self.assertIn(protocol.STATE_WORKING, stream)
             self.assertNotIn(protocol.STATE_FAILED, stream)
+            self.assertNotIn(": done", stream,
+                             "an unverified WORKING task must not send an SSE completion marker")
             tasks = self.post("ListTasks", {})["result"]["tasks"]
             self.assertEqual(len(tasks), 1)
             task_id = tasks[0]["id"]
@@ -333,9 +337,31 @@ class NativeHttpAcceptance(unittest.TestCase):
                 self.fail("streamed task never settled after late response")
             subscription = self.stream("SubscribeToTask", {"id": task_id})
             self.assertIn(protocol.STATE_COMPLETED, subscription)
+            self.assertIn('"task":', subscription,
+                          "SubscribeToTask must begin with the persisted Task snapshot")
             self.assertEqual(self.count, 1)
         finally:
             native._reply_timeout = original_timeout
+            native._SSE_KEEPALIVE = original_keepalive
+
+    def test_subscribe_nonterminal_starts_with_task_and_does_not_claim_done(self):
+        original_timeout = native._reply_timeout
+        original_keepalive = native._SSE_KEEPALIVE
+        native._reply_timeout = lambda: .03
+        native._SSE_KEEPALIVE = .01
+        try:
+            params = self.message("subscribe-still-working")
+            params["configuration"] = {"returnImmediately": True}
+            task_id = self.post("SendMessage", params)["result"]["task"]["id"]
+            stream = self.stream("SubscribeToTask", {"id": task_id})
+            self.assertIn('"task":', stream)
+            self.assertIn(protocol.STATE_WORKING, stream)
+            self.assertNotIn(": done", stream,
+                             "an active task cannot be presented as a terminal stream")
+            self.assertEqual(self.post("GetTask", {"id": task_id})["result"]["id"], task_id)
+        finally:
+            native._reply_timeout = original_timeout
+            native._SSE_KEEPALIVE = original_keepalive
 
     def test_return_immediately_persists_task_then_late_reply(self):
         params = self.message("return-now")
