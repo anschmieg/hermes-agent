@@ -124,3 +124,26 @@ Coordinator should read this note as an evidence checkpoint, not a production GO
 The source-extracted red/green race repro also passed after patch. All execution used temporary local SQLite and fake inference only. Commit `0c20d65` has **no GitHub CI checks or workflow runs**, which is not CI PASS.
 
 **Release remains NO-GO.** Genuine current-sha Python Hermes HTTP ↔ Rakazo TypeScript A2AClient at Rakazo `ed0f29c2d9ea595e19878d2c27635db2f46111b2` was **not executed in this owner run**: default ChatCodex Git clone failed `No space left on device`; our isolated scratch has no installed Node/tsx or Rakazo checkout, and the shared ChatCodex selection subsequently switched to Rakazo owner's workspace. Do not duplicate a live Rakazo-owner run. Rakazo `ed0f29c2` commit reports 19/19 disposable PostgreSQL external tests and 994/994 executor/adapter tests, but those are **owner evidence, not independently retested here**. Required gates still include genuine exact-current-SHA TS↔Python wire E2E, actual authenticated Chief/backend task receipt, backend-confirmed stop/cancellation (native CancelTask intentionally refuses without confirmation), production token/ACL review, and Orchestra acceptance. No production tasks/credentials, unsafe retries, merge or deployment.
+
+
+## 2026-11-08 — owner backend-cancel safety adversarial gate (exact source 0c20d65)
+
+The dedicated existing \`hermes-owner-native-20261108\` ChatCodex workspace executed the *exact* executable \`0c20d65eb068f16e8a24c3e8b8275f04e6164860\` source via a local, read-only Git-object archive; adapter/protocol/ledger/security Git blob IDs were independently checked against GitHub: \`e2f9854\`, \`1ff07a2\`, \`8107300\`, \`beb7fb4\`. No real Chief, production ports, task retries, or credentials.
+
+**New test** \`python3 -u tests/scripts/verify_native_a2a_cancel_restart.py\`: **exit 0; 6/6**. Covers (1) actual child SIGKILL after durable dispatch claim, restart and fail-closed \`CancelTask\` without duplicate dispatch, (2) wrong peer/tenant/agent/root cannot see or cancel private task despite identical external context, (3) late successful settlement from a different process survives attempted cancellation and erroneous later terminal writes, (4) 30 concurrent cancel attempts cannot overwrite completion, (5) genuine ephemeral-loopback HTTP JSON-RPC with fake inference refuses cancellation and later delivers ACK with a single dispatch, (6) forwarded-owner UNKNOWN receipt preserves original \`inputId\`, \`WORKING\` status and no retry/false cancellation, with 403 for unauthorized peer. New test only; no executable change.
+
+**Existing suites rerun against the same exact source**, each exit **0**:
+\`\`\`
+python3 -u tests/scripts/verify_native_a2a_admission_race.py       # 3 tests
+python3 -u tests/scripts/verify_native_a2a_cross_worker.py         # 4 tests
+python3 -u tests/scripts/verify_native_a2a_durable_stdlib.py       # 16 tests incl real SIGKILL
+python3 -u tests/scripts/verify_native_a2a_peer_scope_stdlib.py    # 4 tests
+python3 -u tests/scripts/verify_native_a2a_context_isolation.py    # 22 tests
+python3 -u tests/scripts/verify_native_a2a_http_framing.py        # 3 tests
+python3 -u tests/scripts/verify_native_a2a_push_egress.py         # 8 tests
+\`\`\`
+Total **66/66** targeted tests, 8 suites, separate fresh execution. Isolated fake inference and SQLite/HTTP tests are **not** actual Chief/backend cancellation acceptance.
+
+**Independent source rereview:** \`adapter._rpc_tasks_cancel\` deliberately returns \`ERR_TASK_NOT_CANCELABLE\` for every visible nonterminal task. There is no owner stop/confirmed-cancel RPC in the current read-only \`gateway/session_a2a.py\`; a timed-out or UNKNOWN forwarded receipt remains \`WORKING\` without automatic redispatch. The tests prove safe refusal, **not functional backend-confirmed cancellation**. No new confirmed executable defect from this review.
+
+**Next distinct action / actual blocker:** Chief/backend owner must supply a durable, authenticated, idempotent \`inputId\`-scoped **stop receipt** (or explicit impossibility) plus read-only reconciliation of unknown accepted inputs; bind it to original agent/tenant/peer/session and prove after SIGKILL. Only then can Hermes implement atomic CANCELED settlement and test accepted stop versus racing late completion end-to-end. Until that contract and actual Chief receipts, plus Rakazo-owned cross-runtime E2E and Orchestra gates, **release NO-GO**. No merge/deploy.
