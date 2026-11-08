@@ -372,9 +372,18 @@ class TaskStore:
 
     @staticmethod
     def _in_scope(rec: dict, agent_slug: str = "", tenant: str = "", peer: str = "") -> bool:
+        # A network request always supplies the authenticated peer. The empty
+        # slug/tenant of the root agent is a REAL scope, not a wildcard: if
+        # treated as optional, GetTask/ListTasks on "/" can reveal that same
+        # peer's private served-agent tasks without passing the agent ACL.
+        # Calls with no peer are internal trusted lookups and retain their
+        # historical optional filters.
+        if peer:
+            return (rec.get("peer", "") == peer
+                    and rec.get("agent_slug", "") == agent_slug
+                    and rec.get("tenant", "") == tenant)
         return not ((agent_slug and rec.get("agent_slug", "") != agent_slug)
-                    or (tenant and rec.get("tenant", "") != tenant)
-                    or (peer and rec.get("peer", "") != peer))
+                    or (tenant and rec.get("tenant", "") != tenant))
 
     def _scoped(self, task_id: str, agent_slug: str = "", tenant: str = "", peer: str = "") -> Optional[dict]:
         """Live record if visible in scope. Caller holds the lock."""
