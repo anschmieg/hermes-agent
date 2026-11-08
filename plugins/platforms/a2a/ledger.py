@@ -119,6 +119,7 @@ class DurableTaskLedger:
             conn.close()
 
     def update(self, task_id: str, *, claim: bool = False, allow_terminal: bool = False,
+               require_reserved: bool = False,
                **fields) -> dict | None:
         """Single durable state transition; `claim` is a once-only dispatch gate.
 
@@ -136,6 +137,11 @@ class DurableTaskLedger:
             if not allow_terminal and rec["state"] in {
                 "TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_CANCELED", "TASK_STATE_REJECTED"
             }:
+                conn.rollback()
+                return None
+            if require_reserved and rec.get("effect_state") != "reserved":
+                # A concurrent replay may already have claimed dispatch.
+                # Validation rejection cannot settle a live side effect.
                 conn.rollback()
                 return None
             if claim:
