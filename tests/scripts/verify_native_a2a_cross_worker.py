@@ -89,9 +89,15 @@ class CrossWorkerSubscriptionAndHealth(NativeHttpAcceptance):
             params["configuration"] = {"returnImmediately": True}
             params["tenant"] = "dev"
             task_id = self.post("SendMessage", params, peer="alice")["result"]["task"]["id"]
-            for meth_params in ({"id": task_id}, {"id": task_id, "tenant": "dev"}):
-                denied = self.post("SubscribeToTask", meth_params, peer="bob")
-                self.assertEqual(denied["error"]["code"], protocol.ERR_TASK_NOT_FOUND)
+            # Root task operations must not see another tenant's task,
+            # even if the caller knows its exact task ID.
+            denied = self.post("SubscribeToTask", {"id": task_id}, peer="bob")
+            self.assertEqual(denied["error"]["code"], protocol.ERR_TASK_NOT_FOUND)
+            # Explicit /dev tenant routing is rejected at transport ACL before
+            # invoking SubscribeToTask (HTTP 403, not an in-band 200 error).
+            with self.assertRaises(urllib.error.HTTPError) as denied_route:
+                self.post("SubscribeToTask", {"id": task_id, "tenant": "dev"}, peer="bob")
+            self.assertEqual(denied_route.exception.code, 403)
             root_route = self.post("SubscribeToTask", {"id": task_id}, peer="alice")
             self.assertEqual(root_route["error"]["code"], protocol.ERR_TASK_NOT_FOUND)
             # The allowed route is still usable for authenticated subscribers.
