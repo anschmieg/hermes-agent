@@ -498,11 +498,13 @@ class TaskStore:
                 rec = dict(self._tasks.get(match[0])) if match and match[0] in self._tasks else None
         return dict(rec) if rec and self._in_scope(rec, agent_slug, tenant, peer) else None
 
-    def complete(self, task_id: str, state: str, reply: str = "") -> Optional[dict]:
+    def complete(self, task_id: str, state: str, reply: str = "",
+                 *, require_reserved: bool = False) -> Optional[dict]:
         """Transition a task to a terminal state. Idempotent."""
         if self._ledger:
             rec = self._ledger.update(task_id, state=state, reply=reply,
-                                      effect_state="settled", completed_at=time.time())
+                                      effect_state="settled", completed_at=time.time(),
+                                      require_reserved=require_reserved)
             if rec is None:
                 return None
             with self._lock:
@@ -514,7 +516,8 @@ class TaskStore:
             return dict(rec)
         with self._lock:
             rec = self._tasks.get(task_id)
-            if not rec or rec["state"] in TERMINAL_STATES:
+            if (not rec or rec["state"] in TERMINAL_STATES
+                    or (require_reserved and rec.get("effect_state") != "reserved")):
                 return None
             rec.update(state=state, reply=reply, completed_at=time.time())
             watchers = self._watchers.pop(task_id, [])
