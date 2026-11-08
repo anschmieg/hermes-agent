@@ -537,6 +537,24 @@ class TaskStore:
                 self._watchers.setdefault(task_id, []).append(fut)
             return fut
 
+    def unwatch(self, task_id: str, fut: Future) -> None:
+        """Release a stream's local waiter on timeout/disconnect/remote settlement.
+
+        Durable consumers may observe a completion from another process without
+        local complete() ever popping this Future; do not retain abandoned SSE
+        waiters for the lifetime of a long-running agent.
+        """
+        with self._lock:
+            watchers = self._watchers.get(task_id)
+            if not watchers:
+                return
+            try:
+                watchers.remove(fut)
+            except ValueError:
+                return  # complete() concurrently drained the waiters
+            if not watchers:
+                self._watchers.pop(task_id, None)
+
     def list(self, context_id: str = "", state: str = "", page_size: int = 50, offset: int = 0,
              agent_slug: str = "", tenant: str = "", with_total: bool = False, peer: str = ""):
         """Filtered task page (newest first) as ``(records, next_offset)``, or
