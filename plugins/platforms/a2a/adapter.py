@@ -225,11 +225,16 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             return self._json(200, protocol.metrics.snapshot())
         if subpath not in ("/", "/health"):
             return self._json(404, {"error": "not found"})
-        payload = {"status": "ok", "agent": agent.get("name") or adapter.agent_name}
-        # Agent Cards are public; profile/tenant topology is not leaked on remote unauthenticated GETs.
         sec = adapter._security_context
-        if sec.localhost_only() or sec.authenticate(self.headers.get("Authorization"), self._client_ip()) is not None:
-            payload["served_agents"] = adapter._served_agent_summary(public_url=public_url)
+        identity = sec.authenticate(self.headers.get("Authorization"), self._client_ip())
+        authorized = sec.localhost_only() or (identity is not None and sec.is_trusted_peer(identity))
+        # A private routed agent's name must not leak through /health. A globally
+        # valid bearer token does not authorize enumeration of private served agents.
+        if agent.get("slug") and (not authorized or not adapter._agent_allows_peer(agent, identity or "")):
+            return self._json(404, {"error": "not found"})
+        payload = {"status": "ok", "agent": agent.get("name") or adapter.agent_name}
+        if authorized:
+            payload["served_agents"] = adapter._served_agent_summary(public_url=public_url, peer=identity or "")
         self._json(200, payload)
 
     def do_POST(self):
@@ -473,11 +478,11 @@ class A2AAdapter(BasePlatformAdapter):
         host = f"[{self.host}]" if ":" in self.host else self.host  # IPv6 literal
         return (public_url or "").strip() or f"http://{host}:{self.port}/"
 
-    def _served_agent_summary(self, public_url: Optional[str] = None) -> list[dict]:
+    def _served_agent_summary(self, public_url: Optional[str] = None, peer: str = "") -> list[dict]:
+        """Expose only agents visible to this peer, never private profile or ACL metadata."""
         base = self._base_url(public_url)
-        return [{"slug": a["slug"] or "default", "name": a.get("name"), "url": _join_url(base, a.get("path", "")),
-                 "tenant": a.get("tenant") or None, "profile": a.get("profile"), "local": bool(a.get("local"))}
-                for a in self._agents.values()]
+        return [{"slug": a["slug"] or "default", "name": a.get("name"), "url": _join_url(base, a.get("path", ""))}
+                for a in self._agents.values() if self._agent_allows_peer(a, peer)]
 
     def _route_for_path(self, raw_path: str) -> dict:
         path = urllib.parse.urlsplit(raw_path or "/").path or "/"
@@ -886,25 +891,62 @@ class A2AAdapter(BasePlatformAdapter):
             # Client loss is transport-only, not proof that accepted work failed.
             logger.debug("A2A: stream client disconnected")
 
+    def _await_subscribed_task(self, task_id: str, fut: Future, agent: Optional[dict],
+                               peer: str, keepalive) -> tuple[str, str]:
+        """Wait for local notification OR another process's durable SQLite settlement.
+
+        TaskStore.watch() only notifies local Futures. Periodic scoped ledger
+        reads observe remote completions without replaying backend work.
+        """
+        slug, tenant = self._scope_for_agent(agent)
+        deadline = time.monotonic() + _reply_timeout()
+        last_keepalive = time.monotonic()
+        while True:
+            rec = self.tasks.get(task_id, slug, tenant, peer)
+            if rec is None:
+                return protocol.STATE_WORKING, "[task scope changed; backend outcome unverified]"
+            state, reply = rec["state"], rec.get("reply", "")
+            if state in protocol.TERMINAL_STATES or state == protocol.STATE_INPUT_REQUIRED:
+                return state, reply
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return state, reply
+            interval = min(0.25, max(0.01, _SSE_KEEPALIVE), remaining)
+            if fut.done():
+                # An exceptional local wakeup must not cause a busy loop.
+                time.sleep(interval)
+            else:
+                try:
+                    fut.result(timeout=interval)
+                except FuturesTimeout:
+                    pass
+                except Exception:
+                    # Future errors are not proof of backend settlement.
+                    pass
+            if keepalive and time.monotonic() - last_keepalive >= _SSE_KEEPALIVE:
+                keepalive()  # transport failure does not cancel accepted work
+                last_keepalive = time.monotonic()
+
     def _rpc_tasks_subscribe(self, handler, req_id: Any, params: dict, agent: Optional[dict] = None,
                              peer: str = "") -> None:
-        """Reconnect to an existing task's stream (v1.0 SubscribeToTask)."""
+        """Reconnect to a task, including durable settlement from another worker."""
         task_id, rec, error = self._find_task(req_id, params, agent, peer)
         if error:
             return handler._json(200, error)
+        fut = self.tasks.watch(task_id, *self._scope_for_agent(agent), peer=peer)
+        if fut is None:
+            return handler._json(200, _err(req_id, protocol.ERR_TASK_NOT_FOUND, "task not found"))
         self._sse_headers(handler)
         try:
-            if (fut := self.tasks.watch(task_id, *self._scope_for_agent(agent), peer=peer)) is None:
-                return self._sse_write(handler, protocol.sse_done())
-            # SubscribeToTask starts with the persisted Task snapshot; subsequent
-            # status updates are incremental, not a replacement for the snapshot.
+            # Initial persisted Task snapshot must precede status updates.
             self._sse_write(handler, protocol.sse_data(protocol.stream_task(
                 protocol.TaskStore.to_task(rec)), req_id))
-            state, reply = self._await_future(fut, time.time() + _reply_timeout(), self._keepalive(handler),
-                                              (rec["state"], rec.get("reply", "")))
+            state, reply = self._await_subscribed_task(task_id, fut, agent, peer, self._keepalive(handler))
             self._emit_terminal(handler, task_id, rec["context_id"], state, reply, req_id=req_id)
         except (BrokenPipeError, ConnectionResetError):
             logger.debug("A2A: subscribe client disconnected")
+        finally:
+            self.tasks.unwatch(task_id, fut)
 
     def _find_task(self, req_id: Any, params: dict, agent: Optional[dict], peer: str = "") -> tuple[str, Optional[dict], Optional[dict]]:
         """(task_id, record, None) for a visible task, else (task_id, None, jsonrpc_error)."""
