@@ -148,6 +148,38 @@ class ReceiptAfterAckSigkill(unittest.TestCase):
                          ("TASK_STATE_WORKING", "uncertain", "uncertain"))
 
 
+
+    def test_ambiguous_and_forged_response_metadata_is_not_observation(self):
+        """A single matching top-level identity cannot bless conflicting owner rows."""
+        competing = self.receipt(peer="mallory", status="running", outcome=None)
+        forged = [
+            self.receipt(matches=[self.receipt(), competing]),
+            self.receipt(receipts=[self.receipt(), competing]),
+            self.receipt(query={"peer": "mallory"}),
+            self.receipt(status="running", outcome="canceled"),
+            self.receipt(status="queued", outcome="canceled"),
+            self.receipt(status="queued", outcome=None, stopConfirmed=True),
+        ]
+        for value in forged:
+            with self.subTest(value=value):
+                reader = FakeChiefReadOnly(value)
+                self.assertIsNone(self.lookup(reader))
+                self.assertEqual(len(reader.calls), 1)
+        rec = self.ledger.get(self.task_id)
+        self.assertEqual((rec["state"], rec["effect_state"], rec["stop_attempt_state"]),
+                         ("TASK_STATE_WORKING", "uncertain", "uncertain"))
+        self.assertEqual(self.trace.read_text().splitlines(), ["FAKE_STOP_ACK"])
+
+    def test_once_fresh_owner_receipt_becomes_old_it_fails_closed(self):
+        """A later replay must not turn a stale owner snapshot into fresh evidence."""
+        from unittest.mock import patch
+        candidate = self.receipt(updatedAt=self.attempted + 1)
+        with patch("plugins.platforms.a2a.chief_receipt.time.time",
+                   return_value=self.attempted + 601):
+            self.assertIsNone(self.lookup(FakeChiefReadOnly(candidate)))
+        self.assertIsNone(self.ledger.claim_stop_attempt(self.task_id, **SCOPE))
+        self.assertEqual(self.trace.read_text().splitlines(), ["FAKE_STOP_ACK"])
+
 if __name__ == "__main__":
     if len(sys.argv) == 5 and sys.argv[1] == "--worker":
         worker(*sys.argv[2:])
