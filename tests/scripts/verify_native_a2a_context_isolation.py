@@ -69,6 +69,28 @@ class PeerContextIsolation(NativeHttpAcceptance):
         self.assertEqual(len(sources), 2)
         self.assertNotEqual(sources[0]["chat_id"], sources[1]["chat_id"],
                             "separate served tenants must never share Hermes session")
+        # A root-path GetTask must not treat an empty slug/tenant filter as
+        # a wildcard that reveals a private served-agent task owned by the SAME peer.
+        private_task_id = result["id"]
+        denied = self.post("GetTask", {"id": private_task_id}, peer="alice")
+        self.assertIn("error", denied)
+        self.assertEqual(denied["error"]["code"], protocol.ERR_TASK_NOT_FOUND)
+        recovered = self.post("GetTaskByMessageId", {"messageId": "same-dev"}, peer="alice")
+        self.assertIn("error", recovered)
+        self.assertEqual(recovered["error"]["code"], protocol.ERR_TASK_NOT_FOUND)
+        root_list = self.post("ListTasks", {}, peer="alice")["result"]["tasks"]
+        self.assertNotIn(private_task_id, {task["id"] for task in root_list})
+        cancel = self.post("CancelTask", {"id": private_task_id}, peer="alice")
+        self.assertEqual(cancel["error"]["code"], protocol.ERR_TASK_NOT_FOUND)
+        # The same principal must still access this task on its authorized
+        # /dev route. Tenant scoping must not accidentally deny legitimate reads.
+        allowed = self.post("GetTask", {"id": private_task_id, "tenant": "dev"}, peer="alice")
+        self.assertEqual(allowed["result"]["id"], private_task_id)
+        by_message = self.post("GetTaskByMessageId",
+                               {"messageId": "same-dev", "tenant": "dev"}, peer="alice")
+        self.assertEqual(by_message["result"]["id"], private_task_id)
+        dev_list = self.post("ListTasks", {"tenant": "dev"}, peer="alice")["result"]["tasks"]
+        self.assertIn(private_task_id, {task["id"] for task in dev_list})
 
     def test_foreign_peer_cannot_route_into_another_tenant(self):
         import urllib.error
