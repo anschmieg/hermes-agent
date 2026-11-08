@@ -845,14 +845,17 @@ class A2AAdapter(BasePlatformAdapter):
         return lambda: cls._sse_write(handler, ": keepalive\n\n")
 
     def _emit_terminal(self, handler, task_id: str, context_id: str, state: str, reply: str, req_id: Any = None) -> None:
-        """Emit the final artifact/status events and the closure marker. ``req_id`` threads into the
-        JSON-RPC SSE envelope (§9.4)."""
+        """Emit the current artifact/status events. Only signal intentional stream
+        completion for terminal/interrupted states, never an uncertain WORKING
+        task after an HTTP timeout. ``req_id`` threads into the JSON-RPC SSE
+        envelope (§9.4)."""
         completed = bool(reply) and state == protocol.STATE_COMPLETED
         events = ([protocol.artifact_update(task_id, context_id, reply)] if completed else []) + [
             protocol.status_update(task_id, context_id, state, "" if completed else reply)]
         for ev in events:
             self._sse_write(handler, protocol.sse_data(ev, req_id))
-        self._sse_write(handler, protocol.sse_done())
+        if state in protocol.TERMINAL_STATES or state == protocol.STATE_INPUT_REQUIRED:
+            self._sse_write(handler, protocol.sse_done())
 
     def _rpc_message_stream(self, handler, req_id: Any, params: dict, peer: str, agent: Optional[dict] = None) -> None:
         """message/stream as an SSE response of JSON-RPC-wrapped StreamResponse events (§9.4)."""
@@ -893,6 +896,10 @@ class A2AAdapter(BasePlatformAdapter):
         try:
             if (fut := self.tasks.watch(task_id, *self._scope_for_agent(agent), peer=peer)) is None:
                 return self._sse_write(handler, protocol.sse_done())
+            # SubscribeToTask starts with the persisted Task snapshot; subsequent
+            # status updates are incremental, not a replacement for the snapshot.
+            self._sse_write(handler, protocol.sse_data(protocol.stream_task(
+                protocol.TaskStore.to_task(rec)), req_id))
             state, reply = self._await_future(fut, time.time() + _reply_timeout(), self._keepalive(handler),
                                               (rec["state"], rec.get("reply", "")))
             self._emit_terminal(handler, task_id, rec["context_id"], state, reply, req_id=req_id)
