@@ -177,7 +177,10 @@ class NativeHttpAcceptance(unittest.TestCase):
             self.count += 1
             try:
                 await asyncio.sleep(self.delay)
-                await a.send(event.source.chat_id, "ACK", metadata={"notify": True})
+                # Durable task settlement requires the gateway's correlated final reply.
+                # An unkeyed callback must remain unverified after worker restart.
+                await a.send(event.source.chat_id, "ACK", reply_to=event.message_id,
+                             metadata={"notify": True})
             except Exception:
                 self.errors.append(traceback.format_exc())
 
