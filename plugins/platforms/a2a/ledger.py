@@ -160,6 +160,45 @@ class DurableTaskLedger:
         finally:
             conn.close()
 
+    def claim_stop_attempt(self, task_id: str, *, peer: str, agent_slug: str,
+                           tenant: str, input_id: str) -> dict | None:
+        """Fence a remote stop attempt before any backend call.
+
+        This is NOT stop confirmation: after a crash the marker is uncertain
+        and the stop must not be sent again. Reconcile only by authenticated,
+        read-only lookup of the original owner inputId; a terminal CANCELED
+        receipt additionally requires independent backend-confirmed stop.
+        """
+        if not peer or not input_id:
+            return None
+        conn = self._db()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT record FROM a2a_tasks WHERE task_id=?",
+                               (task_id,)).fetchone()
+            if row is None:
+                conn.rollback()
+                return None
+            rec = json.loads(row[0])
+            if (rec.get("peer") != peer or rec.get("agent_slug", "") != agent_slug
+                    or rec.get("tenant", "") != tenant or rec.get("input_id") != input_id
+                    or rec.get("state") != "TASK_STATE_WORKING"
+                    or rec.get("effect_state") != "uncertain"
+                    or rec.get("stop_attempt_state")):
+                conn.rollback()
+                return None
+            rec["stop_attempt_state"] = "uncertain"
+            rec["stop_attempted_at"] = time.time()
+            conn.execute("UPDATE a2a_tasks SET record=? WHERE task_id=?",
+                         (json.dumps(rec, separators=(",", ":")), task_id))
+            conn.commit()
+            return rec
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def claim_push(self, task_id: str) -> str:
         """Atomically claim a pending callback, avoiding cross-process double push."""
         conn = self._db()
