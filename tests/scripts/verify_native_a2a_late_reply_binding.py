@@ -96,10 +96,27 @@ class LateReplyBinding(unittest.TestCase):
         self.assertEqual(self.store.get(first)["state"], protocol.STATE_WORKING)
         self.assertEqual(self.store.get(second)["state"], protocol.STATE_WORKING)
 
-    def test_legacy_unkeyed_reply_with_one_pending_still_works(self):
-        only, context = self.admit("legacy-unkeyed")
-        self.finish(context, "single result")
-        self.assertEqual(self.store.get(only)["reply"], "single result")
+    def test_unkeyed_reply_with_one_durable_pending_fails_closed(self):
+        only, context = self.admit("durable-unkeyed")
+        self.finish(context, "unverifiable result")
+        self.assertEqual(self.store.get(only)["state"], protocol.STATE_WORKING)
+        self.assertEqual(self.recorded, [])
+
+    def test_late_unkeyed_reply_after_worker_restart_cannot_settle_new_task(self):
+        old, context = self.admit("pre-crash-uncertain")
+        self.adapter._pop_pending(old)  # emulate lost local Future, not lost ledger
+        newer, _ = self.admit("post-restart-working")
+        self.finish(context, "stale old reply without task identity")
+        self.assertEqual(self.store.get(old)["state"], protocol.STATE_WORKING)
+        self.assertEqual(self.store.get(newer)["state"], protocol.STATE_WORKING)
+        self.assertEqual(self.recorded, [])
+
+    def test_legacy_unkeyed_reply_with_one_in_memory_pending_still_works(self):
+        self.adapter.tasks = protocol.TaskStore()
+        self.adapter._add_pending("legacy-task", "legacy-session")
+        result = self.adapter._resolve_oldest_for_context(
+            "legacy-session", protocol.STATE_COMPLETED, "legacy reply")
+        self.assertEqual(result, "legacy-task")
 
 
 if __name__ == "__main__":

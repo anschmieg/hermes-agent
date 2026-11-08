@@ -588,8 +588,10 @@ class A2AAdapter(BasePlatformAdapter):
         The gateway carries MessageEvent.message_id back as ``reply_to`` on a
         final send.  An old/canceled task may reply after a newer task began in
         the same context; FIFO would irrevocably complete the newer task with
-        the stale result.  Legacy unkeyed sends are safe only with *one*
-        unresolved task in the context.  Ambiguity must fail closed.
+        the stale result. Durable tasks require an exact reply_to: after
+        restart, one local pending task can coexist with an older task's
+        unkeyed late reply. Legacy in-memory calls retain the single-pending
+        fallback; ambiguity must fail closed.
         """
         with self._pending_lock:
             if reply_to is not None:
@@ -597,6 +599,11 @@ class A2AAdapter(BasePlatformAdapter):
                 pending = self._pending.get(task_id)
                 if pending and pending[0] == context_id and self._resolve_locked(task_id, state, text):
                     return task_id
+                return None
+            # A durable journal outlives this worker's local Futures. After
+            # SIGKILL/restart an unkeyed old reply could be misbound to the
+            # sole *new* pending task, even when local FIFO looks unambiguous.
+            if getattr(self.tasks, "_ledger", None) is not None:
                 return None
             unresolved = [tid for tid in self._pending_order.get(context_id, ())
                           if tid in self._pending and not self._pending[tid][1].done()]
@@ -1105,7 +1112,7 @@ class A2AAdapter(BasePlatformAdapter):
         """Fulfil the task identified by ``reply_to`` (``chat_id`` = private A2A session key).
         Only sends carrying ``metadata['notify']`` (the base adapter's final-reply marker) satisfy
         the caller; progress/status/preview sends must not. Unkeyed sends can
-        settle only a single unambiguous pending task."""
+        settle only a single unambiguous pending task in a legacy in-memory store."""
         if not (metadata or {}).get("notify"):
             logger.debug("A2A: ignoring non-final send for context %s", chat_id)
         else:
