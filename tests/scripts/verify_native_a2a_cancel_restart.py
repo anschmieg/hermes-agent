@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -132,6 +133,41 @@ class DurableCancelSafety(unittest.TestCase):
 
 
 class IsolatedHttpCancelSafety(unittest.TestCase):
+    def test_forwarded_unknown_receipt_keeps_original_input_id_and_never_retries(self):
+        h = http_shim.NativeHttpAcceptance("test_timeout_retry_and_late_terminal_receipt")
+        h.setUp()
+        self.addCleanup(h.doCleanups)
+        h.adapter._agents["dev"] = {"slug": "dev", "tenant": "dev", "path": "/dev",
+                                    "local": False, "profile": "dev", "name": "dev",
+                                    "allowed_peers": {"alice"}}
+        calls = []
+        finished = threading.Event()
+
+        def fake_unknown(_agent, _peer, _context, _framed, *, input_id):
+            calls.append(input_id)
+            finished.set()
+            return "[owner execution unverified]", protocol.STATE_WORKING
+
+        h.adapter._forward_to_profile = fake_unknown
+        params = h.message("forwarded-timeout-unknown")
+        params["tenant"] = "dev"
+        params["configuration"] = {"returnImmediately": True}
+        first = h.post("SendMessage", params)
+        task_id = first["result"]["task"]["id"]
+        self.assertTrue(finished.wait(3), "isolated forwarded owner was never reached")
+        self.assertEqual(h.post("SendMessage", params)["result"]["task"]["id"], task_id)
+        self.assertEqual(len(calls), 1, "unknown receipt must never cause second dispatch")
+        self.assertTrue(calls[0].startswith("a2a-msg:"))
+        rec = h.adapter.tasks.get(task_id, "dev", "dev", "alice")
+        self.assertEqual(rec["input_id"], calls[0])
+        self.assertEqual(rec["state"], protocol.STATE_WORKING)
+        self.assertEqual(h.post("CancelTask", {"id": task_id, "tenant": "dev"})
+                         ["error"]["code"], protocol.ERR_TASK_NOT_CANCELABLE)
+        with self.assertRaises(urllib.error.HTTPError) as denied:
+            h.post("GetTask", {"id": task_id, "tenant": "dev"}, peer="bob")
+        self.assertEqual(denied.exception.code, 403)
+        self.assertEqual(h.adapter.tasks.get(task_id)["state"], protocol.STATE_WORKING)
+
     def test_loopback_jsonrpc_rejects_cancel_until_fake_backend_completion(self):
         # Exercise real native HTTP/JSON-RPC routing with a deterministic fake
         # gateway inference handler; no external service or live task involved.
