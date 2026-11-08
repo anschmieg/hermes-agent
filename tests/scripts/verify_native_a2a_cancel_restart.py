@@ -12,11 +12,13 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import verify_native_a2a_peer_scope_stdlib as shim  # noqa: F401
+import verify_native_a2a_durable_stdlib as http_shim
 from plugins.platforms.a2a import adapter, protocol
 from plugins.platforms.a2a.ledger import DurableTaskLedger, IdempotencyConflict
 
@@ -127,6 +129,40 @@ class DurableCancelSafety(unittest.TestCase):
             self.assertIsNotNone(self.adapter.tasks.complete(task, protocol.STATE_COMPLETED, "ACK"))
         self.assertEqual(set(f.result() for f in pending), {protocol.ERR_TASK_NOT_CANCELABLE})
         self.assertEqual(self.adapter.tasks.get(task)["reply"], "ACK")
+
+
+class IsolatedHttpCancelSafety(unittest.TestCase):
+    def test_loopback_jsonrpc_rejects_cancel_until_fake_backend_completion(self):
+        # Exercise real native HTTP/JSON-RPC routing with a deterministic fake
+        # gateway inference handler; no external service or live task involved.
+        h = http_shim.NativeHttpAcceptance("test_timeout_retry_and_late_terminal_receipt")
+        h.setUp()
+        self.addCleanup(h.doCleanups)
+        old_timeout = adapter._reply_timeout
+        adapter._reply_timeout = lambda: 0.025
+        self.addCleanup(setattr, adapter, "_reply_timeout", old_timeout)
+        h.delay = 0.3
+        payload = h.message("cancel-http-unique")
+        first = h.post("SendMessage", payload)
+        task_id = first["result"]["task"]["id"]
+        self.assertEqual(first["result"]["task"]["status"]["state"], protocol.STATE_WORKING)
+        self.assertEqual(h.post("CancelTask", {"id": task_id}, peer="bob")
+                         ["error"]["code"], protocol.ERR_TASK_NOT_FOUND)
+        for _ in range(6):
+            self.assertEqual(h.post("CancelTask", {"id": task_id})
+                             ["error"]["code"], protocol.ERR_TASK_NOT_CANCELABLE)
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline:
+            result = h.post("GetTask", {"id": task_id})["result"]
+            if result["status"]["state"] == protocol.STATE_COMPLETED:
+                break
+            time.sleep(0.025)
+        self.assertEqual(result["status"]["state"], protocol.STATE_COMPLETED, h.errors)
+        self.assertEqual(protocol.extract_text(result["artifacts"][0]), "ACK")
+        self.assertEqual(h.post("CancelTask", {"id": task_id})
+                         ["error"]["code"], protocol.ERR_TASK_NOT_CANCELABLE)
+        self.assertEqual(h.post("SendMessage", payload)["result"]["task"]["id"], task_id)
+        self.assertEqual(h.count, 1)
 
 
 if __name__ == "__main__":
