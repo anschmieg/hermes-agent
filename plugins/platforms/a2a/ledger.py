@@ -43,7 +43,17 @@ class DurableTaskLedger:
             pass
         conn = self._db()
         try:
-            conn.execute("PRAGMA journal_mode=WAL")
+            # SQLite can reject simultaneous first-use WAL activation
+            # immediately, despite busy_timeout. Retry only transient locks;
+            # persistent locks and other SQLite errors remain fail-closed.
+            for attempt in range(5):
+                try:
+                    conn.execute("PRAGMA journal_mode=WAL")
+                    break
+                except sqlite3.OperationalError as exc:
+                    if "locked" not in str(exc).lower() or attempt == 4:
+                        raise
+                    time.sleep(0.05 * (attempt + 1))
             conn.execute("""CREATE TABLE IF NOT EXISTS a2a_tasks (
                 task_id TEXT PRIMARY KEY,
                 peer TEXT NOT NULL,
