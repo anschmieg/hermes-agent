@@ -134,6 +134,11 @@ class DurableTaskLedger:
                      "stop_attempt_state", "stop_attempted_at"}
         if immutable.intersection(fields):
             return None
+        # allow_terminal is exclusively for push-configuration metadata after
+        # settlement. Never let a stale worker rewrite an authoritative outcome
+        # or forge cancellation through this metadata-only escape hatch.
+        if allow_terminal and (claim or not fields.keys() <= {"push_url", "push_config_id"}):
+            return None
         conn = self._db()
         try:
             conn.execute("BEGIN IMMEDIATE")

@@ -78,6 +78,7 @@ jobs:
             tests/scripts/verify_native_a2a_stop_ack_gap.py
             tests/plugins/test_a2a_sigkill_replay_terminal.py
             tests/plugins/test_a2a_sigkill_restart_http.py
+            tests/scripts/verify_native_a2a_terminal_metadata_fence.py
           )
           count=0
           for suite in "${suites[@]}"; do
