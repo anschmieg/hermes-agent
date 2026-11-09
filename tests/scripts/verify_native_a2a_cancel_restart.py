@@ -301,6 +301,23 @@ class UnverifiedCallbackCancelSafety(unittest.TestCase):
             self.assertFalse(self.store.claim_dispatch(task_id),
                              "stale local cancel must never permit re-dispatch")
 
+    def test_direct_outcome_sink_rejects_unverified_canceled_without_side_effects(self):
+        from unittest.mock import patch
+        task_id = self.new_task("forged-direct-cancel")
+        client = adapter.A2AAdapter.__new__(adapter.A2AAdapter)
+        client.tasks = self.store
+        client._send_push_notification = lambda *_args: None
+        with patch.object(protocol, "persist_message", lambda *_args, **_kwargs: None), \
+             patch.object(adapter.security, "audit", lambda *_args, **_kwargs: None):
+            self.assertFalse(client._record_outcome(
+                task_id, "ctx-forged-direct-cancel", "alice",
+                protocol.STATE_CANCELED, "no independently confirmed backend STOP"))
+        rec = protocol.TaskStore(DurableTaskLedger(self.db)).get(
+            task_id, "private", "tenant-a", "alice")
+        self.assertEqual((rec["state"], rec["effect_state"], rec["reply"]),
+                         (protocol.STATE_WORKING, "uncertain", ""))
+        self.assertFalse(self.store.claim_dispatch(task_id))
+
     def test_normal_success_and_failure_outcomes_remain_terminal(self):
         for name, outcome, expected in (
             ("ok", "SUCCESS", protocol.STATE_COMPLETED),
