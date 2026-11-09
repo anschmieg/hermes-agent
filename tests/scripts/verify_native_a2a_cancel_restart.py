@@ -314,7 +314,7 @@ class UnverifiedCallbackCancelSafety(unittest.TestCase):
                     self.assertEqual(rec["reply"], "normal streamed response")
 
 if __name__ == "__main__":
-    if len(sys.argv) == 7 and sys.argv[1] == "--callback-worker":
+    if len(sys.argv) == 6 and sys.argv[1] == "--callback-worker":
         _callback_cancel_worker(*sys.argv[2:])
     else:
         unittest.main(verbosity=2)
