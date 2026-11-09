@@ -1,0 +1,2 @@
+Re-trigger source-pinned 13-suite verification after workflow registration.
+Original executable source SHA 6f8222f32685176d80d04f984ee74aaca78f537d remains immutable.
