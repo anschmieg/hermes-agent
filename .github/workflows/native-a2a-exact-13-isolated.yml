@@ -2,6 +2,7 @@
 # checked out at the immutable original feature SHA, never this CI branch.
 # Offline fake Chief only; no live backend actions or release assertions.
 name: Isolated native A2A 13-suite exact-source gate
+run-name: "Verify original 9c4dcb1 / 13 suites / isolated CI"
 on:
   push:
     branches:
