@@ -126,6 +126,13 @@ class DurableTaskLedger:
         Returns None for a lost claim, missing task, or attempted mutation of a
         terminal state. A claimed task remains WORKING after crash/restart.
         """
+        # Receipt identity is minted at admission, not mutable through task
+        # state transitions. Otherwise a stale/cross-tenant worker could
+        # retarget an idempotency record or its original Chief inputId.
+        immutable = {"task_id", "context_id", "peer", "agent_slug", "tenant",
+                     "message_id", "input_id", "created_at", "created_iso"}
+        if immutable.intersection(fields):
+            return None
         conn = self._db()
         try:
             conn.execute("BEGIN IMMEDIATE")
