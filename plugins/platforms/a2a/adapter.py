@@ -789,7 +789,12 @@ class A2AAdapter(BasePlatformAdapter):
     def _record_outcome(self, task_id: str, context_id: str, peer: str, state: str, reply: str,
                         started: Optional[float] = None) -> bool:
         """Settle once, durably, even when the original HTTP caller is gone."""
-        if state == protocol.STATE_WORKING:
+        if state in (protocol.STATE_WORKING, protocol.STATE_CANCELED):
+            # No independently authenticated backend STOP receipt is available here.
+            # A local cancellation callback/forwarded status cannot settle durable
+            # CANCELED, even if the caller directly reaches this outcome writer.
+            if state == protocol.STATE_CANCELED:
+                logger.warning("A2A: refused unverified canceled outcome for task %s", task_id)
             return False
         reply = security.redact_outbound(reply or "")
         stripped = reply.lstrip()
@@ -1167,9 +1172,14 @@ class A2AAdapter(BasePlatformAdapter):
             # reads for /goal and /loop.
             _streamed = getattr(event, "_streamed_final_response", "")
             default = (protocol.STATE_COMPLETED, _streamed if isinstance(_streamed, str) else "")
+            # Core ProcessingOutcome.CANCELLED means an *expected asyncio task
+            # cancellation*, not an authenticated backend STOP acknowledgement.
+            # Release the HTTP waiter but leave the durable task WORKING and
+            # claimed across restarts until an authoritative outcome arrives.
             state, reply = {
                 ProcessingOutcome.FAILURE: (protocol.STATE_FAILED, "[agent processing failed]"),
-                ProcessingOutcome.CANCELLED: (protocol.STATE_CANCELED, ""),
+                ProcessingOutcome.CANCELLED: (
+                    protocol.STATE_WORKING, "[backend stop unverified; task outcome uncertain]"),
             }.get(outcome, default)
             if self._resolve_task(task_id, state, reply):
                 rec = self.tasks.get(task_id)
