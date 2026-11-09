@@ -1,0 +1,104 @@
+# Isolated verifier only. The executable source and every native suite are
+# checked out at the immutable original feature SHA, never this CI branch.
+# Offline fake Chief only; no live backend actions or release assertions.
+name: Isolated native A2A 13-suite exact-source gate
+on:
+  push:
+    branches:
+      - ci/native-a2a-13suite-9c4dcb1-20261109-0901
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-a2a-13:
+    name: Independent exact SHA / 13 suites (fake Chief)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout ORIGINAL executable source (never verification commit)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 9c4dcb11e9a9cdaea3104cf97d775c59cd2ca1c7
+          persist-credentials: false
+
+      - name: Install pinned Python and locked test dependencies
+        uses: ./.github/actions/setup-pm
+        with:
+          toolchain: python
+          extras: '[]'
+          test-environment: 'true'
+          save-tools-cache: 'false'
+          save-python-cache: 'false'
+
+      - name: Assert exact original source and local-only test runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          observed="$(git rev-parse HEAD)"
+          echo "SOURCE_EXPECTED=9c4dcb11e9a9cdaea3104cf97d775c59cd2ca1c7"
+          echo "SOURCE_OBSERVED=$observed"
+          test "$observed" = "9c4dcb11e9a9cdaea3104cf97d775c59cd2ca1c7"
+          test -z "$(git status --porcelain)"
+          "$HERMES_PYTHON" - <<'PY'
+          import os, signal, sqlite3, sys
+          assert os.name == 'posix' and hasattr(signal, 'SIGKILL')
+          assert sys.version_info >= (3, 11)
+          print('PYTHON=' + sys.version.split()[0])
+          print('SQLITE=' + sqlite3.sqlite_version)
+          PY
+
+      - name: Execute all 13 independent suites with raw command, tests and exit
+        shell: bash
+        env:
+          OPENAI_API_KEY: ''
+          OPENROUTER_API_KEY: ''
+          NOUS_API_KEY: ''
+        run: |
+          set -euo pipefail
+          suites=(
+            tests/scripts/verify_native_a2a_peer_scope_stdlib.py
+            tests/scripts/verify_native_a2a_durable_stdlib.py
+            tests/scripts/verify_native_a2a_admission_race.py
+            tests/scripts/verify_native_a2a_context_isolation.py
+            tests/scripts/verify_native_a2a_cross_worker.py
+            tests/scripts/verify_native_a2a_http_framing.py
+            tests/scripts/verify_native_a2a_late_reply_binding.py
+            tests/scripts/verify_native_a2a_cancel_restart.py
+            tests/scripts/verify_native_a2a_push_egress.py
+            tests/scripts/verify_native_a2a_stop_receipt_scope.py
+            tests/scripts/verify_native_a2a_stop_ack_gap.py
+            tests/plugins/test_a2a_sigkill_replay_terminal.py
+            tests/plugins/test_a2a_sigkill_restart_http.py
+          )
+          n=0
+          total=0
+          for suite in "${suites[@]}"; do
+            n=$((n+1))
+            echo "::group::suite=$n $suite"
+            printf 'COMMAND[%d]=timeout 240 %q -u %q\n' "$n" "$HERMES_PYTHON" "$suite"
+            logfile="$(mktemp)"
+            set +e
+            timeout 240 "$HERMES_PYTHON" -u "$suite" >"$logfile" 2>&1
+            code=$?
+            set -e
+            cat "$logfile"
+            counts="$(sed -nE 's/^Ran ([0-9]+) tests? in .*/\1/p' "$logfile")"
+            count="$(printf '%s\n' "$counts" | tail -1)"
+            if [[ ! "$counts" =~ ^[1-9][0-9]*$ ]] || ! grep -Eq '^OK$' "$logfile" || grep -Eq '^OK \(skipped=|^FAILED|skipped=' "$logfile"; then
+              echo "RESULT[$n] suite=$suite count=${count:-UNPROVEN} exit=$code validation=INVALID"
+              rm -f "$logfile"
+              exit 1
+            fi
+            echo "RESULT[$n] suite=$suite count=$count exit=$code"
+            rm -f "$logfile"
+            if test "$code" -ne 0; then
+              echo "FAILED_SUITE=$suite"
+              exit "$code"
+            fi
+            total=$((total+count))
+            echo "::endgroup::"
+          done
+          test "$n" -eq 13
+          echo "PASS original_source=9c4dcb11e9a9cdaea3104cf97d775c59cd2ca1c7 suites=$n tests=$total exit=0 fake_chief_only=true"
