@@ -201,5 +201,120 @@ class IsolatedHttpCancelSafety(unittest.TestCase):
         self.assertEqual(h.count, 1)
 
 
+def _callback_cancel_worker(db: str, task_id: str, outcome: str, stale: str) -> None:
+    """Exact original adapter + SQLite callback, then actual SIGKILL; no external calls."""
+    import asyncio
+    import os
+    from enum import Enum
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    # The stdlib-only fixture stubs gateway.platforms.event to avoid importing
+    # the full gateway. These values mirror the real core ProcessingOutcome enum,
+    # whose CANCELLED is an expected asyncio.CancelledError, NOT a STOP receipt.
+    class CoreOutcome(Enum):
+        SUCCESS = "success"
+        FAILURE = "failure"
+        CANCELLED = "cancelled"
+
+    client = adapter.A2AAdapter.__new__(adapter.A2AAdapter)
+    client.tasks = protocol.TaskStore(DurableTaskLedger(Path(db)))
+    client._pending_lock = threading.RLock()
+    client._pending = {}
+    client._pending_order = {}
+    client._active_tasks = set()
+    rec = client.tasks.get(task_id)
+    assert rec is not None and rec["state"] == protocol.STATE_WORKING
+    future = client._add_pending(task_id, rec["context_id"])
+    context = client._execution_context_id(
+        {"slug": rec["agent_slug"], "tenant": rec["tenant"]}, rec["peer"], rec["context_id"])
+    forged = stale == "stale"
+    event = SimpleNamespace(
+        message_id=task_id,
+        source=SimpleNamespace(chat_id="foreign-session" if forged else context,
+                               user_id="mallory" if forged else rec["peer"]),
+        metadata={"tenant": "tenant-b" if forged else rec["tenant"],
+                  "peer": "mallory" if forged else rec["peer"],
+                  "contextId": "foreign-context" if forged else rec["context_id"],
+                  "taskId": "foreign-task" if forged else task_id,
+                  "inputId": "foreign-input" if forged else rec["input_id"],
+                  "sessionId": "foreign-session" if forged else context,
+                  "generation": "stale" if forged else "current"},
+        _streamed_final_response="normal streamed response",
+    )
+    client._send_push_notification = lambda *_args: None
+    with patch.object(adapter, "ProcessingOutcome", CoreOutcome), \
+         patch.object(protocol, "persist_message", lambda *_args, **_kwargs: None), \
+         patch.object(adapter.security, "audit", lambda *_args, **_kwargs: None):
+        asyncio.run(client.on_processing_complete(event, CoreOutcome[outcome]))
+    assert future.done(), "completion hook must release waiting HTTP future"
+    os.kill(os.getpid(), signal.SIGKILL)
+
+
+@unittest.skipUnless(hasattr(signal, "SIGKILL"), "requires actual SIGKILL")
+class UnverifiedCallbackCancelSafety(unittest.TestCase):
+    """A local core CANCELLED event is not independent authenticated backend STOP."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(prefix="a2a-callback-cancel-")
+        self.addCleanup(temp.cleanup)
+        self.db = Path(temp.name) / "tasks.sqlite3"
+        self.store = protocol.TaskStore(DurableTaskLedger(self.db))
+        self.scope = {"peer": "alice", "agent_slug": "private", "tenant": "tenant-a",
+                      "input_id": "a2a-msg:" + "c" * 64}
+
+    def new_task(self, message_id: str):
+        rec, replay = self.store.admit(
+            "alice", message_id,
+            {"message": {"messageId": message_id, "role": "ROLE_USER",
+                         "parts": [{"text": "local fake only"}]}},
+            "ctx-" + message_id, "private", "tenant-a",
+            input_id=self.scope["input_id"])
+        self.assertFalse(replay)
+        self.assertTrue(self.store.claim_dispatch(rec["task_id"]))
+        return rec["task_id"]
+
+    def killed_callback(self, task_id: str, outcome: str, stale: str):
+        proc = subprocess.run(
+            [sys.executable, "-u", __file__, "--callback-worker",
+             str(self.db), task_id, outcome, stale],
+            cwd=Path(__file__).resolve().parents[2],
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, -signal.SIGKILL, proc.stderr)
+        # Force real process restart / WAL reopen, not just an in-memory snapshot.
+        self.store = protocol.TaskStore(DurableTaskLedger(self.db))
+        return self.store.get(task_id, "private", "tenant-a", "alice")
+
+    def test_local_cancelled_without_stop_authority_survives_sigkill_and_late_callback(self):
+        task_id = self.new_task("unverified-cancel")
+        for variant in ("legitimate-core-cancel", "stale-late-cancel"):
+            rec = self.killed_callback(task_id, "CANCELLED",
+                                       "stale" if variant == "stale-late-cancel" else "current")
+            self.assertEqual((rec["state"], rec["effect_state"], rec["input_id"]),
+                             (protocol.STATE_WORKING, "uncertain", self.scope["input_id"]),
+                             variant)
+            self.assertEqual(self.store.get_by_message(
+                "alice", "unverified-cancel", "private", "tenant-a")["state"],
+                protocol.STATE_WORKING)
+            self.assertIsNone(self.store.get(task_id, "private", "tenant-b", "alice"))
+            self.assertIsNone(self.store.get(task_id, "private", "tenant-a", "mallory"))
+            self.assertFalse(self.store.claim_dispatch(task_id),
+                             "stale local cancel must never permit re-dispatch")
+
+    def test_normal_success_and_failure_outcomes_remain_terminal(self):
+        for name, outcome, expected in (
+            ("ok", "SUCCESS", protocol.STATE_COMPLETED),
+            ("error", "FAILURE", protocol.STATE_FAILED),
+        ):
+            with self.subTest(outcome=outcome):
+                task_id = self.new_task(name)
+                rec = self.killed_callback(task_id, outcome, "current")
+                self.assertEqual((rec["state"], rec["effect_state"]), (expected, "settled"))
+                if outcome == "SUCCESS":
+                    self.assertEqual(rec["reply"], "normal streamed response")
+
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    if len(sys.argv) == 7 and sys.argv[1] == "--callback-worker":
+        _callback_cancel_worker(*sys.argv[2:])
+    else:
+        unittest.main(verbosity=2)
