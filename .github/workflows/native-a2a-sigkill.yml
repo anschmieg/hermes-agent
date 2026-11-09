@@ -68,14 +68,18 @@ jobs:
             tests/scripts/verify_native_a2a_durable_stdlib.py
             tests/scripts/verify_native_a2a_admission_race.py
             tests/scripts/verify_native_a2a_context_isolation.py
+            tests/scripts/verify_native_a2a_immutable_scope.py
             tests/scripts/verify_native_a2a_cross_worker.py
             tests/scripts/verify_native_a2a_http_framing.py
             tests/scripts/verify_native_a2a_late_reply_binding.py
             tests/scripts/verify_native_a2a_forward_receipt_binding.py
+            tests/scripts/verify_native_a2a_forward_terminal_gate.py
             tests/scripts/verify_native_a2a_cancel_restart.py
             tests/scripts/verify_native_a2a_push_egress.py
             tests/scripts/verify_native_a2a_stop_receipt_scope.py
             tests/scripts/verify_native_a2a_stop_ack_gap.py
+            tests/scripts/verify_native_a2a_stop_attempt_clock.py
+            tests/scripts/verify_native_a2a_stop_lease_write_once.py
             tests/plugins/test_a2a_sigkill_replay_terminal.py
             tests/plugins/test_a2a_sigkill_restart_http.py
             tests/scripts/verify_native_a2a_terminal_metadata_fence.py
