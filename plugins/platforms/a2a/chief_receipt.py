@@ -54,6 +54,11 @@ def lookup_stop_receipt(ledger: Any, task_id: str, *, peer: str, agent_slug: str
                "updatedAt", "outcome", "stopConfirmed", "authority"}
     if any(type(key) is not str or key not in allowed for key in receipt):
         return None
+    # A free-form authority payload cannot authenticate an endpoint; reject
+    # nested or conflicting provenance instead of treating it as an owner row.
+    authority = receipt.get("authority")
+    if authority is not None and (type(authority) is not str or authority != "chief"):
+        return None
     expected = {"inputId": input_id, "peer": peer, "agent": agent_slug,
                 "tenant": tenant, "contextId": rec["context_id"]}
     if any(type(receipt.get(k)) is not str or receipt[k] != v
@@ -79,7 +84,9 @@ def lookup_stop_receipt(ledger: Any, task_id: str, *, peer: str, agent_slug: str
     stop_claim = receipt.get("stopConfirmed")
     if stop_claim is not None and type(stop_claim) is not bool:
         return None
-    if stop_claim is True and status != "terminal":
+    if stop_claim is True and (status != "terminal" or outcome != "canceled"):
+        # Stop confirmation attached to a completed/failed/unspecified outcome
+        # is contradictory metadata, not a scoped owner observation.
         return None
     # Even status=terminal + outcome=canceled + stopConfirmed=true does NOT
     # prove a backend stop. Never produce terminal/canceled Hermes state.
