@@ -142,6 +142,13 @@ class DurableTaskLedger:
                 conn.rollback()
                 return None
             rec = json.loads(row[0])
+            # A fenced STOP attempt records intent, never backend confirmation.
+            # A late/unverified cancel event cannot settle the side effect, even
+            # through allow_terminal metadata updates after crash or restart.
+            if (rec.get("stop_attempt_state") == "uncertain"
+                    and fields.get("state") == "TASK_STATE_CANCELED"):
+                conn.rollback()
+                return None
             if not allow_terminal and rec["state"] in {
                 "TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_CANCELED", "TASK_STATE_REJECTED"
             }:
