@@ -88,6 +88,13 @@ def lookup_stop_receipt(ledger: Any, task_id: str, *, peer: str, agent_slug: str
         # Stop confirmation attached to a completed/failed/unspecified outcome
         # is contradictory metadata, not a scoped owner observation.
         return None
+    # Owner I/O can overlap a durable completion, restart, or changed stop
+    # attempt. Do not report a WORKING observation from a stale snapshot.
+    try:
+        if ledger.get(task_id) != rec:
+            return None
+    except Exception:
+        return None
     # Even status=terminal + outcome=canceled + stopConfirmed=true does NOT
     # prove a backend stop. Never produce terminal/canceled Hermes state.
     return {"task_id": task_id, "input_id": input_id, "owner_status": status,

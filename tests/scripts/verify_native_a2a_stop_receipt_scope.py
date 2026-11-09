@@ -149,6 +149,39 @@ class ReceiptAfterAckSigkill(unittest.TestCase):
 
 
 
+    def test_local_completion_during_owner_lookup_rejects_stale_observation(self):
+        """Fake lookup races a real SQLite terminal transition; no stale WORKING."""
+        class CompletingReader(FakeChiefReadOnly):
+            def lookup_input(inner, **scope):
+                inner.calls.append(scope)
+                self.assertIsNotNone(self.ledger.update(
+                    self.task_id, state="TASK_STATE_COMPLETED",
+                    reply="completed independently", effect_state="settled"))
+                return inner.receipt
+
+        reader = CompletingReader(self.receipt())
+        self.assertIsNone(self.lookup(reader))
+        self.assertEqual(len(reader.calls), 1)
+        self.assertEqual(self.ledger.get(self.task_id)["state"], "TASK_STATE_COMPLETED")
+        self.assertEqual(self.trace.read_text().splitlines(), ["FAKE_STOP_ACK"])
+
+    def test_stop_attempt_generation_change_during_lookup_fails_closed(self):
+        """A changed durable attempt cannot inherit an earlier owner's snapshot."""
+        class RestartedAttemptReader(FakeChiefReadOnly):
+            def lookup_input(inner, **scope):
+                inner.calls.append(scope)
+                self.assertIsNotNone(self.ledger.update(
+                    self.task_id, stop_attempted_at=self.attempted + 30))
+                return inner.receipt
+
+        reader = RestartedAttemptReader(self.receipt())
+        self.assertIsNone(self.lookup(reader))
+        self.assertEqual(len(reader.calls), 1)
+        self.assertEqual(self.ledger.get(self.task_id)["stop_attempted_at"],
+                         self.attempted + 30)
+        self.assertEqual(self.trace.read_text().splitlines(), ["FAKE_STOP_ACK"])
+
+
     def test_ambiguous_and_forged_response_metadata_is_not_observation(self):
         """A single matching top-level identity cannot bless conflicting owner rows."""
         competing = self.receipt(peer="mallory", status="running", outcome=None)
