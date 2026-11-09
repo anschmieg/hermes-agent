@@ -772,10 +772,17 @@ class A2AAdapter(BasePlatformAdapter):
                     for field, expected in expected_owner.items())):
             logger.warning("A2A: forwarded receipt binding unverified for profile %r", profile)
             return "[owner receipt binding unverified; do not re-dispatch]", protocol.STATE_WORKING
+        # Only a terminal owner admission with a recognized terminal outcome
+        # may settle the A2A task. A queued/stale/ambiguous response after
+        # restart is not evidence of completed or failed execution.
+        outcome = receipt.get("outcome")
+        if (receipt.get("status") != "terminal"
+                or type(outcome) is not str
+                or outcome not in {"completed", "failed", "interrupted"}):
+            logger.warning("A2A: forwarded terminal outcome unverified for profile %r", profile)
+            return "[owner terminal outcome unverified; do not re-dispatch]", protocol.STATE_WORKING
         result = receipt.get('result') or {}
-        completed = receipt.get('outcome') == 'completed' and not result.get('failed')
-        if receipt.get("status") == "unknown":
-            return "[owner execution unknown; do not re-dispatch]", protocol.STATE_WORKING
+        completed = outcome == 'completed' and not result.get('failed')
         return (security.redact_outbound(result.get('final_response') or ''),
                 protocol.STATE_COMPLETED if completed else protocol.STATE_FAILED)
 
