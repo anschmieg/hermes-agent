@@ -170,6 +170,32 @@ class ReceiptAfterAckSigkill(unittest.TestCase):
                          ("TASK_STATE_WORKING", "uncertain", "uncertain"))
         self.assertEqual(self.trace.read_text().splitlines(), ["FAKE_STOP_ACK"])
 
+    def test_forged_chief_authority_endpoint_and_stop_provenance_fail_closed(self):
+        """A matching top-level inputId must not bless forged or contradictory claims."""
+        original = self.ledger.get(self.task_id)
+        forged = [
+            self.receipt(authority={
+                "name": "chief", "inputId": SCOPE["input_id"],
+                "tenant": "tenant-b", "endpoint": "https://untrusted.invalid",
+                "backendStopConfirmed": True}),
+            self.receipt(authority=["chief", "backend-stop"]),
+            self.receipt(authority=True),
+            self.receipt(authority="untrusted-endpoint"),
+            self.receipt(outcome="completed", stopConfirmed=True),
+            self.receipt(outcome="failed", stopConfirmed=True),
+            self.receipt(outcome=None, stopConfirmed=True),
+            self.receipt(inputId="a2a-msg:" + "b" * 64),
+            self.receipt(tenant="tenant-b"),
+            self.receipt(endpoint="https://untrusted.invalid"),
+        ]
+        for candidate in forged:
+            with self.subTest(candidate=candidate):
+                fake = FakeChiefReadOnly(candidate)
+                self.assertIsNone(self.lookup(fake))
+                self.assertEqual(len(fake.calls), 1)
+        self.assertEqual(self.ledger.get(self.task_id), original)
+        self.assertEqual(self.trace.read_text().splitlines(), ["FAKE_STOP_ACK"])
+
     def test_once_fresh_owner_receipt_becomes_old_it_fails_closed(self):
         """A later replay must not turn a stale owner snapshot into fresh evidence."""
         from unittest.mock import patch
