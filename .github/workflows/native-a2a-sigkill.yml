@@ -71,6 +71,7 @@ jobs:
             tests/scripts/verify_native_a2a_cross_worker.py
             tests/scripts/verify_native_a2a_http_framing.py
             tests/scripts/verify_native_a2a_late_reply_binding.py
+            tests/scripts/verify_native_a2a_forward_receipt_binding.py
             tests/scripts/verify_native_a2a_cancel_restart.py
             tests/scripts/verify_native_a2a_push_egress.py
             tests/scripts/verify_native_a2a_stop_receipt_scope.py
