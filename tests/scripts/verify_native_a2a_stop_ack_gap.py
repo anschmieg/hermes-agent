@@ -76,6 +76,41 @@ class RemoteStopAckCrashGap(unittest.TestCase):
         self.assertEqual(a.tasks.get(self.task_id)["state"], protocol.STATE_WORKING)
         self.assertEqual(self.trace.read_text().splitlines(), ["FAKE_STOP_ACK"])
 
+    def test_unverified_stop_ack_sigkill_never_authorizes_canceled(self):
+        """SIGKILL after fake ACK cannot be upgraded to backend-confirmed CANCELED."""
+        proc = subprocess.run(
+            [sys.executable or "/usr/bin/python3", "-u", __file__, "--worker",
+             str(self.db), str(self.trace), self.task_id],
+            cwd=Path(__file__).resolve().parents[2], capture_output=True,
+            text=True, timeout=20)
+        self.assertEqual(proc.returncode, -signal.SIGKILL, proc.stderr)
+        recovered = DurableTaskLedger(self.db)
+        self.assertIsNone(recovered.update(
+            self.task_id, state=protocol.STATE_CANCELED, effect_state="settled"))
+        rec = recovered.get(self.task_id)
+        self.assertEqual((rec["state"], rec["effect_state"], rec["stop_attempt_state"]),
+                         (protocol.STATE_WORKING, "uncertain", "uncertain"))
+        self.assertIsNone(recovered.claim_stop_attempt(self.task_id, **SCOPE))
+        replayed, replay = recovered.reserve(
+            peer="alice", message_id="stop-gap", payload=PAYLOAD, context_id="ctx",
+            agent_slug="private", tenant="tenant-a", input_id=SCOPE["input_id"])
+        self.assertTrue(replay)
+        self.assertEqual(replayed["task_id"], self.task_id)
+        self.assertIsNone(recovered.update(self.task_id, claim=True))
+
+    def test_stop_uncertain_canceled_does_not_bypass_with_allow_terminal(self):
+        """Even privileged metadata maintenance cannot forge cancellation."""
+        self.assertIsNotNone(self.ledger.claim_stop_attempt(self.task_id, **SCOPE))
+        self.assertIsNone(self.ledger.update(
+            self.task_id, state=protocol.STATE_CANCELED,
+            effect_state="settled", allow_terminal=True))
+        self.assertEqual(self.ledger.get(self.task_id)["state"], protocol.STATE_WORKING)
+        # A later genuinely completed execution may settle normally.
+        self.assertIsNotNone(self.ledger.update(
+            self.task_id, state=protocol.STATE_COMPLETED,
+            effect_state="settled", reply="owner completed"))
+        self.assertEqual(self.ledger.get(self.task_id)["reply"], "owner completed")
+
     def test_fences_peer_tenant_agent_and_authoritative_input_identity(self):
         for bad in ({**SCOPE, "peer": "bob"}, {**SCOPE, "tenant": "tenant-b"},
                     {**SCOPE, "agent_slug": ""}, {**SCOPE, "agent_slug": "other"},
