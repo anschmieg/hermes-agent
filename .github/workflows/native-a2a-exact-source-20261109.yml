@@ -1,0 +1,87 @@
+# Isolated 13-suite verification of an immutable source commit; no Chief/external peer calls.
+# This workflow is verification-branch CI ONLY, not original-feature CI or GO.
+name: Native A2A exact-source 13-suite independent verification
+on:
+  push:
+    branches:
+      - ci/native-a2a-source-pin-6f8222-20261109-0759
+permissions:
+  contents: read
+jobs:
+  exact-source-native-13:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout the immutable ORIGINAL feature executable source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 6f8222f32685176d80d04f984ee74aaca78f537d
+          persist-credentials: false
+      - name: Assert executable source commit AND complete tree identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          actual_tree="$(git rev-parse HEAD^{tree})"
+          test "$actual" = "6f8222f32685176d80d04f984ee74aaca78f537d"
+          test "$actual_tree" = "1b5cc39a7bcf426167e9c87146e28b155a1bf86d"
+          git diff --quiet HEAD -- plugins/platforms/a2a tests/plugins tests/scripts
+          echo "SOURCE_PIN_OK commit=$actual source_tree=$actual_tree"
+      - name: Install source-pinned test interpreter and deps
+        uses: ./.github/actions/setup-pm
+        with:
+          toolchain: python
+          extras: '[]'
+          test-environment: 'true'
+          save-tools-cache: 'false'
+          save-python-cache: 'false'
+      - name: Execute every official suite with explicit test counts and actual exit codes
+        shell: bash
+        env:
+          OPENAI_API_KEY: ''
+          OPENROUTER_API_KEY: ''
+          NOUS_API_KEY: ''
+        run: |
+          set -euo pipefail
+          count=0
+          total=0
+          printf '| Suite | Tests | Process exit |\n|---|---:|---:|\n' >> "$GITHUB_STEP_SUMMARY"
+          while IFS= read -r suite; do
+            test -n "$suite" || continue
+            echo "::group::SUITE $suite"
+            log="$(mktemp)"
+            if timeout 240 "$HERMES_PYTHON" -u "$suite" > "$log" 2>&1; then
+              rc=0
+            else
+              rc=$?
+            fi
+            cat "$log"
+            tests="$(sed -nE 's/^Ran ([0-9]+) tests? in .*/\1/p' "$log" | tail -n 1)"
+            echo "SUITE_RESULT path=$suite tests=${tests:-NONE} process_exit=$rc"
+            printf '| `%s` | %s | %s |\n' "$suite" "${tests:-NONE}" "$rc" >> "$GITHUB_STEP_SUMMARY"
+            if (( rc != 0 )) || [[ ! "$tests" =~ ^[1-9][0-9]*$ ]] || grep -Eq '^OK \(skipped=|^FAILED|^Ran 0 tests' "$log"; then
+              echo "::error::Actual suite failure or missing/skipped tests: $suite (process_exit=$rc)"
+              rm -f "$log"
+              exit 1
+            fi
+            count=$(( count + 1 ))
+            total=$(( total + tests ))
+            rm -f "$log"
+            echo "::endgroup::"
+          done <<'OFFICIAL_SUITES'
+          tests/scripts/verify_native_a2a_peer_scope_stdlib.py
+          tests/scripts/verify_native_a2a_durable_stdlib.py
+          tests/scripts/verify_native_a2a_admission_race.py
+          tests/scripts/verify_native_a2a_context_isolation.py
+          tests/scripts/verify_native_a2a_cross_worker.py
+          tests/scripts/verify_native_a2a_http_framing.py
+          tests/scripts/verify_native_a2a_late_reply_binding.py
+          tests/scripts/verify_native_a2a_cancel_restart.py
+          tests/scripts/verify_native_a2a_push_egress.py
+          tests/scripts/verify_native_a2a_stop_receipt_scope.py
+          tests/scripts/verify_native_a2a_stop_ack_gap.py
+          tests/plugins/test_a2a_sigkill_replay_terminal.py
+          tests/plugins/test_a2a_sigkill_restart_http.py
+          OFFICIAL_SUITES
+          test "$count" -eq 13
+          echo "FULL_13_PASS source=6f8222f32685176d80d04f984ee74aaca78f537d suites=$count tests=$total exit=0"
