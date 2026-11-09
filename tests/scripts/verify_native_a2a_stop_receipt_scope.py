@@ -165,22 +165,49 @@ class ReceiptAfterAckSigkill(unittest.TestCase):
         self.assertEqual(self.ledger.get(self.task_id)["state"], "TASK_STATE_COMPLETED")
         self.assertEqual(self.trace.read_text().splitlines(), ["FAKE_STOP_ACK"])
 
-    def test_stop_attempt_generation_change_during_lookup_fails_closed(self):
-        """A changed durable attempt cannot inherit an earlier owner's snapshot."""
-        class RestartedAttemptReader(FakeChiefReadOnly):
+    def test_stop_attempt_is_write_once_across_sigkill_restart_and_read_only_lookup(self):
+        """Real post-SIGKILL retry cannot re-stamp the original stop attempt."""
+        self.assertIsNone(self.ledger.update(
+            self.task_id, stop_attempted_at=self.attempted + 30))
+        restarted = DurableTaskLedger(self.db)
+        self.assertIsNone(restarted.claim_stop_attempt(self.task_id, **SCOPE))
+        self.assertEqual(restarted.get(self.task_id)["stop_attempted_at"], self.attempted)
+        observed = self.lookup(FakeChiefReadOnly(self.receipt()))
+        self.assertIsNotNone(observed)
+        self.assertEqual(observed["stop_confirmed"], False)
+        self.assertEqual(self.ledger.get(self.task_id)["stop_attempted_at"], self.attempted)
+        self.assertEqual(self.ledger.get(self.task_id)["state"], "TASK_STATE_WORKING")
+        self.assertEqual(self.trace.read_text().splitlines(), ["FAKE_STOP_ACK"])
+
+    def test_out_of_band_stop_attempt_mutation_invalidates_owner_snapshot(self):
+        """A corrupted journal generation cannot inherit an earlier lookup snapshot.
+
+        This test deliberately bypasses the immutable production ledger API;
+        no legitimate retry is allowed to change stop_attempted_at.
+        """
+        import json
+        import sqlite3
+
+        class TamperingReader(FakeChiefReadOnly):
             def lookup_input(inner, **scope):
                 inner.calls.append(scope)
-                self.assertIsNotNone(self.ledger.update(
-                    self.task_id, stop_attempted_at=self.attempted + 30))
+                with sqlite3.connect(self.db) as connection:
+                    row = connection.execute(
+                        "SELECT record FROM a2a_tasks WHERE task_id=?",
+                        (self.task_id,)).fetchone()
+                    altered = json.loads(row[0])
+                    altered["stop_attempted_at"] = self.attempted + 30
+                    connection.execute(
+                        "UPDATE a2a_tasks SET record=? WHERE task_id=?",
+                        (json.dumps(altered, separators=(",", ":")), self.task_id))
                 return inner.receipt
 
-        reader = RestartedAttemptReader(self.receipt())
+        reader = TamperingReader(self.receipt())
         self.assertIsNone(self.lookup(reader))
         self.assertEqual(len(reader.calls), 1)
         self.assertEqual(self.ledger.get(self.task_id)["stop_attempted_at"],
                          self.attempted + 30)
         self.assertEqual(self.trace.read_text().splitlines(), ["FAKE_STOP_ACK"])
-
 
     def test_ambiguous_and_forged_response_metadata_is_not_observation(self):
         """A single matching top-level identity cannot bless conflicting owner rows."""
