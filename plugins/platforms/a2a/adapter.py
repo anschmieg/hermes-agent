@@ -750,11 +750,16 @@ class A2AAdapter(BasePlatformAdapter):
         home = _profile_home(profile)
         if not home:
             return "[profile unavailable]", protocol.STATE_FAILED
+        # Bind a terminal owner answer to the immutable forwarded admission.
+        # Identity mismatches (including absent identity on an older gateway)
+        # leave the claimed task uncertain, never settled from another turn.
+        expected_owner = dict(
+            agent=str(agent.get("slug") or profile or "agent"),
+            tenant=str(agent.get("tenant") or ""), peer=peer, context_id=context_id,
+            input_id=input_id or protocol.new_task_id())
         try:
             receipt = asyncio.run(forward_to_owner(
-                home, agent=str(agent.get("slug") or profile or "agent"),
-                tenant=str(agent.get("tenant") or ""), peer=peer, context_id=context_id,
-                input_id=input_id or protocol.new_task_id(), text=framed_text,
+                home, **expected_owner, text=framed_text,
                 timeout=int(agent.get("timeout") or _reply_timeout())))
         except TimeoutError:
             return "[profile reply unverified; accepted work was not cancelled]", protocol.STATE_WORKING
@@ -762,6 +767,11 @@ class A2AAdapter(BasePlatformAdapter):
             # Boundary for a network peer: the full error stays in the local log, the reply is redacted.
             logger.warning("A2A: dispatch to profile %r unverified", profile, exc_info=True)
             return "[profile dispatch status uncertain; reconcile using the original inputId]", protocol.STATE_WORKING
+        if (type(receipt) is not dict or
+                any(type(receipt.get(field)) is not str or receipt[field] != expected
+                    for field, expected in expected_owner.items())):
+            logger.warning("A2A: forwarded receipt binding unverified for profile %r", profile)
+            return "[owner receipt binding unverified; do not re-dispatch]", protocol.STATE_WORKING
         result = receipt.get('result') or {}
         completed = receipt.get('outcome') == 'completed' and not result.get('failed')
         if receipt.get("status") == "unknown":
