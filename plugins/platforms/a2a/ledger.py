@@ -130,7 +130,8 @@ class DurableTaskLedger:
         # state transitions. Otherwise a stale/cross-tenant worker could
         # retarget an idempotency record or its original Chief inputId.
         immutable = {"task_id", "context_id", "peer", "agent_slug", "tenant",
-                     "message_id", "input_id", "created_at", "created_iso"}
+                     "message_id", "input_id", "created_at", "created_iso",
+                     "stop_attempt_state"}
         if immutable.intersection(fields):
             return None
         conn = self._db()
