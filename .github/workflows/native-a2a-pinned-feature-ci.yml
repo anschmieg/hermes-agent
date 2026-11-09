@@ -1,0 +1,90 @@
+# CI-only independent verification of original feature SHA 41180f8. Only local fake inference;
+# never contacts Chief, a live A2A peer, or an external backend.
+name: Native A2A CI-only pinned original feature verification
+
+on:
+  push:
+    branches:
+      - ci/native-a2a-sigkill-baseline-20261108
+
+permissions:
+  contents: read
+
+jobs:
+  native-sigkill:
+    name: Exact-SHA native crash / tenant / retry / cancellation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout pinned original feature SHA (never a mutable branch)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: 41180f8f1fc95de7297cc18a2024bd312964e4a8
+          persist-credentials: false
+
+      - name: Install repo-pinned Python and locked test dependencies
+        uses: ./.github/actions/setup-pm
+        with:
+          toolchain: python
+          extras: '[]'
+          test-environment: 'true'
+          save-tools-cache: 'false'
+          save-python-cache: 'false'
+
+      - name: Verify exact source, POSIX SIGKILL, Python and SQLite
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "41180f8f1fc95de7297cc18a2024bd312964e4a8"
+          "$HERMES_PYTHON" - <<'PY'
+          import os, signal, sqlite3, sys
+          assert os.name == "posix" and hasattr(signal, "SIGKILL")
+          assert sys.version_info >= (3, 11)
+          print("EXACT_SOURCE=" + "41180f8f1fc95de7297cc18a2024bd312964e4a8")
+          print("PYTHON=" + sys.version.split()[0])
+          print("SQLITE=" + sqlite3.sqlite_version)
+          PY
+
+      - name: Independent native A2A exact-source suites (no skips)
+        shell: bash
+        env:
+          OPENAI_API_KEY: ''
+          OPENROUTER_API_KEY: ''
+          NOUS_API_KEY: ''
+        run: |
+          set -euo pipefail
+          suites=(
+            tests/scripts/verify_native_a2a_peer_scope_stdlib.py
+            tests/scripts/verify_native_a2a_durable_stdlib.py
+            tests/scripts/verify_native_a2a_admission_race.py
+            tests/scripts/verify_native_a2a_context_isolation.py
+            tests/scripts/verify_native_a2a_cross_worker.py
+            tests/scripts/verify_native_a2a_http_framing.py
+            tests/scripts/verify_native_a2a_late_reply_binding.py
+            tests/scripts/verify_native_a2a_cancel_restart.py
+            tests/scripts/verify_native_a2a_push_egress.py
+            tests/scripts/verify_native_a2a_stop_receipt_scope.py
+            tests/scripts/verify_native_a2a_stop_ack_gap.py
+            tests/plugins/test_a2a_sigkill_replay_terminal.py
+            tests/plugins/test_a2a_sigkill_restart_http.py
+          )
+          count=0
+          for suite in "${suites[@]}"; do
+            echo "::group::$suite"
+            log="$(mktemp)"
+            if ! timeout 240 "$HERMES_PYTHON" -u "$suite" 2>&1 | tee "$log"; then
+              echo "::error::Failed: $suite"
+              rm -f "$log"
+              exit 1
+            fi
+            if ! grep -Eq '^Ran [1-9][0-9]* tests? in ' "$log" || grep -Eq '^OK \(skipped=|^FAILED|^Ran 0 tests' "$log"; then
+              echo "::error::Missing/filtered tests or skipped tests: $suite"
+              rm -f "$log"
+              exit 1
+            fi
+            tests="$(sed -nE 's/^Ran ([0-9]+) tests? in .*/\1/p' "$log" | tail -n 1)"
+            count=$((count + tests))
+            rm -f "$log"
+            echo "::endgroup::"
+          done
+          echo "PASS exact_SHA=41180f8f1fc95de7297cc18a2024bd312964e4a8 suites=${#suites[@]} native_tests=$count exit=0"
