@@ -131,7 +131,7 @@ class DurableTaskLedger:
         # retarget an idempotency record or its original Chief inputId.
         immutable = {"task_id", "context_id", "peer", "agent_slug", "tenant",
                      "message_id", "input_id", "created_at", "created_iso",
-                     "stop_attempt_state"}
+                     "stop_attempt_state", "stop_attempted_at"}
         if immutable.intersection(fields):
             return None
         conn = self._db()
