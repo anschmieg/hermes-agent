@@ -22,13 +22,13 @@ jobs:
       OPENROUTER_API_KEY: ""
       NOUS_API_KEY: ""
       HERMES_HOME: ${{ runner.temp }}/hermes-a2a-offline
-      HEAD_SHA: afb7e778889b0f2ed17e00b16bd60686e41150dc
+      HEAD_SHA: c79fac10fb6a6b2d7b775de7c963740e30359553
       UNSAFE_SHA: 1244903edc3cd67ed03b131b2965d25c788ae0fa
     steps:
       - name: Read exact original executable source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: afb7e778889b0f2ed17e00b16bd60686e41150dc
+          ref: c79fac10fb6a6b2d7b775de7c963740e30359553
           fetch-depth: 1
           persist-credentials: false
       - name: Verify immutable pin and current test blob
@@ -74,6 +74,50 @@ jobs:
             UnverifiedCallbackCancelSafety.test_direct_outcome_sink_rejects_unverified_canceled_without_side_effects \
             UnverifiedCallbackCancelSafety.test_normal_success_and_failure_outcomes_remain_terminal
           echo "CANCEL-ONLY GREEN: ORIGINAL $HEAD_SHA; forged scope separately gated."
+
+      - name: All 19 exact-original A2A security suites (no skips)
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          suites=(
+            tests/scripts/verify_native_a2a_peer_scope_stdlib.py
+            tests/scripts/verify_native_a2a_durable_stdlib.py
+            tests/scripts/verify_native_a2a_admission_race.py
+            tests/scripts/verify_native_a2a_context_isolation.py
+            tests/scripts/verify_native_a2a_immutable_scope.py
+            tests/scripts/verify_native_a2a_cross_worker.py
+            tests/scripts/verify_native_a2a_http_framing.py
+            tests/scripts/verify_native_a2a_late_reply_binding.py
+            tests/scripts/verify_native_a2a_forward_receipt_binding.py
+            tests/scripts/verify_native_a2a_forward_terminal_gate.py
+            tests/scripts/verify_native_a2a_cancel_restart.py
+            tests/scripts/verify_native_a2a_push_egress.py
+            tests/scripts/verify_native_a2a_stop_receipt_scope.py
+            tests/scripts/verify_native_a2a_stop_ack_gap.py
+            tests/scripts/verify_native_a2a_stop_attempt_clock.py
+            tests/scripts/verify_native_a2a_stop_lease_write_once.py
+            tests/plugins/test_a2a_sigkill_replay_terminal.py
+            tests/plugins/test_a2a_sigkill_restart_http.py
+            tests/scripts/verify_native_a2a_terminal_metadata_fence.py
+          )
+          passed=0
+          for suite in "${suites[@]}"; do
+            echo "::group::$suite"
+            log="$(mktemp)"
+            if ! timeout 240 python3 -u "$suite" >"$log" 2>&1; then
+              cat "$log"; rm -f "$log"; echo "::error::failed suite $suite"; exit 1
+            fi
+            cat "$log"
+            if ! grep -Eq '^Ran [1-9][0-9]* tests? in ' "$log" || grep -Eq '^OK \(skipped=|^FAILED|^Ran 0 tests' "$log"; then
+              echo "::error::zero tests or skipped suite: $suite"; rm -f "$log"; exit 1
+            fi
+            n="$(sed -nE 's/^Ran ([0-9]+) tests? in .*/\1/p' "$log" | tail -n 1)"
+            passed=$(( passed + n ))
+            rm -f "$log"
+            echo "::endgroup::"
+          done
+          echo "ALL_19_GREEN EXACT_SOURCE=$HEAD_SHA suites=${#suites[@]} tests=$passed"
 
       - name: Exact ORIGINAL forged cross-scope SUCCESS/FAILURE SIGKILL gate
         shell: bash
