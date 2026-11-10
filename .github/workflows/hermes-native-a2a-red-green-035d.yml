@@ -75,6 +75,29 @@ jobs:
             UnverifiedCallbackCancelSafety.test_normal_success_and_failure_outcomes_remain_terminal
           echo "CANCEL-ONLY GREEN: ORIGINAL $HEAD_SHA; forged scope separately gated."
 
+      - name: Exact ORIGINAL forged cross-scope SUCCESS/FAILURE SIGKILL gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          set +e
+          python3 -u tests/scripts/verify_native_a2a_cancel_restart.py \
+            UnverifiedCallbackCancelSafety.test_forged_stale_success_failure_cannot_settle_foreign_task_after_sigkill \
+            > "$RUNNER_TEMP/hermes-forged.log" 2>&1
+          rc=$?
+          set -e
+          cat "$RUNNER_TEMP/hermes-forged.log"
+          if [ "$rc" -eq 0 ]; then
+            echo "FORGED SCOPE GREEN: ORIGINAL $HEAD_SHA, both outcomes and real SIGKILL."
+          elif grep -q '^FAIL: test_forged_stale_success_failure_cannot_settle_foreign_task_after_sigkill ' "$RUNNER_TEMP/hermes-forged.log" \
+               && ! grep -q '^ERROR: ' "$RUNNER_TEMP/hermes-forged.log"; then
+            echo "::error::FORGED SCOPE RED on exact ORIGINAL $HEAD_SHA; source needs fail-closed repair."
+            exit 1
+          else
+            echo "::error::INCONCLUSIVE forged callback probe (import, test, or subprocess failure)."
+            exit 2
+          fi
+
       - name: All 19 exact-original A2A security suites (no skips)
         shell: bash
         run: |
@@ -118,27 +141,3 @@ jobs:
             echo "::endgroup::"
           done
           echo "ALL_19_GREEN EXACT_SOURCE=$HEAD_SHA suites=${#suites[@]} tests=$passed"
-
-      - name: Exact ORIGINAL forged cross-scope SUCCESS/FAILURE SIGKILL gate
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
-          set +e
-          python3 -u tests/scripts/verify_native_a2a_cancel_restart.py \
-            UnverifiedCallbackCancelSafety.test_forged_stale_success_failure_cannot_settle_foreign_task_after_sigkill \
-            > "$RUNNER_TEMP/hermes-forged.log" 2>&1
-          rc=$?
-          set -e
-          cat "$RUNNER_TEMP/hermes-forged.log"
-          if [ "$rc" -eq 0 ]; then
-            echo "FORGED SCOPE GREEN: ORIGINAL $HEAD_SHA, both outcomes and real SIGKILL."
-          elif grep -q '^FAIL: test_forged_stale_success_failure_cannot_settle_foreign_task_after_sigkill ' "$RUNNER_TEMP/hermes-forged.log" \
-               && ! grep -q '^ERROR: ' "$RUNNER_TEMP/hermes-forged.log"; then
-            echo "::error::FORGED SCOPE RED on exact ORIGINAL $HEAD_SHA; source needs fail-closed repair."
-            exit 1
-          else
-            echo "::error::INCONCLUSIVE forged callback probe (import, test, or subprocess failure)."
-            exit 2
-          fi
-
