@@ -247,7 +247,11 @@ def _callback_cancel_worker(db: str, task_id: str, outcome: str, stale: str) -> 
          patch.object(protocol, "persist_message", lambda *_args, **_kwargs: None), \
          patch.object(adapter.security, "audit", lambda *_args, **_kwargs: None):
         asyncio.run(client.on_processing_complete(event, CoreOutcome[outcome]))
-    assert future.done(), "completion hook must release waiting HTTP future"
+    # Only a matching callback may fulfil the victim future. A rejected forged
+    # callback may legitimately leave it pending; both paths must still reach
+    # real SIGKILL so persistence is verified after independent WAL recovery.
+    if not forged:
+        assert future.done(), "matching completion must release waiting HTTP future"
     os.kill(os.getpid(), signal.SIGKILL)
 
 
