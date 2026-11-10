@@ -22,13 +22,13 @@ jobs:
       OPENROUTER_API_KEY: ""
       NOUS_API_KEY: ""
       HERMES_HOME: ${{ runner.temp }}/hermes-a2a-offline
-      HEAD_SHA: 035d36b76715e69ddcc9066312be309c04676dca
+      HEAD_SHA: fdbee23b1c7fd2373551eb4a2ff1c27772b55c5e
       UNSAFE_SHA: 1244903edc3cd67ed03b131b2965d25c788ae0fa
     steps:
       - name: Read exact original executable source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: 035d36b76715e69ddcc9066312be309c04676dca
+          ref: fdbee23b1c7fd2373551eb4a2ff1c27772b55c5e
           fetch-depth: 1
           persist-credentials: false
       - name: Verify immutable pin and current test blob
@@ -36,7 +36,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$HEAD_SHA"
-          test "$(git rev-parse HEAD:tests/scripts/verify_native_a2a_cancel_restart.py)" = "cdbc85b75ebb280c81aeb27d8a5e82a41bd28352"
+          test "$(git rev-parse HEAD:tests/scripts/verify_native_a2a_cancel_restart.py)" = "ae126476f02c6d3623d22fdb9f74f914459f1c0b"
           python3 --version
       - name: Deterministic RED on prior unsafe ORIGINAL executable source
         shell: bash
@@ -64,11 +64,37 @@ jobs:
           grep -q '^FAIL: test_direct_outcome_sink_rejects_unverified_canceled_without_side_effects ' "$RUNNER_TEMP/hermes-red.log"
           ! grep -q '^ERROR: ' "$RUNNER_TEMP/hermes-red.log"
           echo "CONFIRMED RED: unsafe ORIGINAL $UNSAFE_SHA, real SIGKILL and direct sink."
-      - name: Current ORIGINAL GREEN - full cancellation/restart script
+      - name: Current ORIGINAL GREEN - local cancel and ordinary outcome controls
         shell: bash
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$HEAD_SHA"
-          python3 -u tests/scripts/verify_native_a2a_cancel_restart.py
-          echo "CONFIRMED GREEN: ORIGINAL $HEAD_SHA."
+          python3 -u tests/scripts/verify_native_a2a_cancel_restart.py \
+            UnverifiedCallbackCancelSafety.test_local_cancelled_without_stop_authority_survives_sigkill_and_late_callback \
+            UnverifiedCallbackCancelSafety.test_direct_outcome_sink_rejects_unverified_canceled_without_side_effects \
+            UnverifiedCallbackCancelSafety.test_normal_success_and_failure_outcomes_remain_terminal
+          echo "CANCEL-ONLY GREEN: ORIGINAL $HEAD_SHA; forged scope separately gated."
+
+      - name: Exact ORIGINAL forged cross-scope SUCCESS/FAILURE SIGKILL gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          set +e
+          python3 -u tests/scripts/verify_native_a2a_cancel_restart.py \
+            UnverifiedCallbackCancelSafety.test_forged_stale_success_failure_cannot_settle_foreign_task_after_sigkill \
+            > "$RUNNER_TEMP/hermes-forged.log" 2>&1
+          rc=$?
+          set -e
+          cat "$RUNNER_TEMP/hermes-forged.log"
+          if [ "$rc" -eq 0 ]; then
+            echo "FORGED SCOPE GREEN: ORIGINAL $HEAD_SHA, both outcomes and real SIGKILL."
+          elif grep -q '^FAIL: test_forged_stale_success_failure_cannot_settle_foreign_task_after_sigkill ' "$RUNNER_TEMP/hermes-forged.log" \
+               && ! grep -q '^ERROR: ' "$RUNNER_TEMP/hermes-forged.log"; then
+            echo "::error::FORGED SCOPE RED on exact ORIGINAL $HEAD_SHA; source needs fail-closed repair."
+            exit 1
+          else
+            echo "::error::INCONCLUSIVE forged callback probe (import, test, or subprocess failure)."
+            exit 2
+          fi
 
