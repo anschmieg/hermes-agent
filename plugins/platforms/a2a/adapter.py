@@ -538,6 +538,10 @@ class A2AAdapter(BasePlatformAdapter):
     def _add_pending(self, task_id: str, context_id: str) -> Future:
         fut: Future = Future()
         with self._pending_lock:
+            # Test-only adapters built with __new__ do not run __init__.
+            # Production always creates this map during normal construction.
+            if not hasattr(self, "_pending_events"):
+                self._pending_events = {}
             self._active_tasks.add(task_id)
             self._pending[task_id] = (context_id, fut)
             self._pending_order.setdefault(context_id, deque()).append(task_id)
@@ -617,7 +621,7 @@ class A2AAdapter(BasePlatformAdapter):
     def _pop_pending(self, task_id: str) -> None:
         with self._pending_lock:
             self._active_tasks.discard(task_id)
-            self._pending_events.pop(task_id, None)
+            getattr(self, "_pending_events", {}).pop(task_id, None)
             entry = self._pending.pop(task_id, None)
             order = self._pending_order.get(entry[0]) if entry else None
             if order and task_id in order:
