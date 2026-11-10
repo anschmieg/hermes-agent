@@ -22,13 +22,13 @@ jobs:
       OPENROUTER_API_KEY: ""
       NOUS_API_KEY: ""
       HERMES_HOME: ${{ runner.temp }}/hermes-a2a-offline
-      HEAD_SHA: c79fac10fb6a6b2d7b775de7c963740e30359553
+      HEAD_SHA: ${{ github.sha }}
       UNSAFE_SHA: 1244903edc3cd67ed03b131b2965d25c788ae0fa
     steps:
       - name: Read exact original executable source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: c79fac10fb6a6b2d7b775de7c963740e30359553
+          ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
       - name: Verify immutable pin and current test blob
@@ -36,7 +36,8 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$HEAD_SHA"
-          test "$(git rev-parse HEAD:tests/scripts/verify_native_a2a_cancel_restart.py)" = "934da05bfee00b9d8912a7db98f1d1bac05aeacc"
+          test "$(git rev-parse HEAD:tests/scripts/verify_native_a2a_cancel_restart.py)" = "ad4ed3e7a50b864915341092345484e771f6fec2"
+          test "$(git rev-parse HEAD:plugins/platforms/a2a/adapter.py)" = "eae260e2c449b8d0cd53df754be3a6f954404c75"
           python3 --version
       - name: Deterministic RED on prior unsafe ORIGINAL executable source
         shell: bash
