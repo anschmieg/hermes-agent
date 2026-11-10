@@ -36,7 +36,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$HEAD_SHA"
-          test "$(git rev-parse HEAD:tests/scripts/verify_native_a2a_cancel_restart.py)" = "ad4ed3e7a50b864915341092345484e771f6fec2"
+          test "$(git rev-parse HEAD:tests/scripts/verify_native_a2a_cancel_restart.py)" = "390d09ee7abc8c7469cde4e77ecbee9cd535d826"
           test "$(git rev-parse HEAD:plugins/platforms/a2a/adapter.py)" = "eae260e2c449b8d0cd53df754be3a6f954404c75"
           python3 --version
       - name: Deterministic RED on prior unsafe ORIGINAL executable source
