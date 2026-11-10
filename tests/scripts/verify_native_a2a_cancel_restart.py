@@ -301,6 +301,22 @@ class UnverifiedCallbackCancelSafety(unittest.TestCase):
             self.assertFalse(self.store.claim_dispatch(task_id),
                              "stale local cancel must never permit re-dispatch")
 
+    def test_forged_stale_success_failure_cannot_settle_foreign_task_after_sigkill(self):
+        # Test-first: event.message_id alone is not an authenticated per-task
+        # identity. The worker forges a foreign peer/tenant/context/input/session/
+        # generation while retaining the victim's task_id; then real SIGKILL
+        # forces independent WAL recovery. Normal outcomes have separate controls.
+        for outcome in ("SUCCESS", "FAILURE"):
+            with self.subTest(outcome=outcome):
+                task_id = self.new_task("cross-scope-" + outcome.lower())
+                rec = self.killed_callback(task_id, outcome, "stale")
+                self.assertEqual(
+                    (rec["state"], rec["effect_state"], rec["reply"]),
+                    (protocol.STATE_WORKING, "uncertain", ""),
+                    "unverified cross-scope callback must not commit " + outcome,
+                )
+                self.assertFalse(self.store.claim_dispatch(task_id))
+
     def test_direct_outcome_sink_rejects_unverified_canceled_without_side_effects(self):
         from unittest.mock import patch
         task_id = self.new_task("forged-direct-cancel")
