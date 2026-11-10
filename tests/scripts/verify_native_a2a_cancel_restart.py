@@ -228,18 +228,25 @@ def _callback_cancel_worker(db: str, task_id: str, outcome: str, stale: str) -> 
     future = client._add_pending(task_id, rec["context_id"])
     context = client._execution_context_id(
         {"slug": rec["agent_slug"], "tenant": rec["tenant"]}, rec["peer"], rec["context_id"])
-    forged = stale == "stale"
+    assert stale in {"current", "stale", "spoofed"}
+    forged = stale != "current"
+    # Production MessageEvent from _prepare_task has empty metadata. It must
+    # still settle a normal callback; trusting self-reported metadata is unsafe.
+    # "spoofed" deliberately gives a foreign source the victim's metadata.
+    metadata = {} if not forged else {
+        "tenant": "tenant-b" if stale == "stale" else rec["tenant"],
+        "peer": "mallory" if stale == "stale" else rec["peer"],
+        "contextId": "foreign-context" if stale == "stale" else rec["context_id"],
+        "taskId": "foreign-task" if stale == "stale" else task_id,
+        "inputId": "foreign-input" if stale == "stale" else rec["input_id"],
+        "sessionId": "foreign-session" if stale == "stale" else context,
+        "generation": "stale" if stale == "stale" else "current",
+    }
     event = SimpleNamespace(
         message_id=task_id,
         source=SimpleNamespace(chat_id="foreign-session" if forged else context,
                                user_id="mallory" if forged else rec["peer"]),
-        metadata={"tenant": "tenant-b" if forged else rec["tenant"],
-                  "peer": "mallory" if forged else rec["peer"],
-                  "contextId": "foreign-context" if forged else rec["context_id"],
-                  "taskId": "foreign-task" if forged else task_id,
-                  "inputId": "foreign-input" if forged else rec["input_id"],
-                  "sessionId": "foreign-session" if forged else context,
-                  "generation": "stale" if forged else "current"},
+        metadata=metadata,
         _streamed_final_response="normal streamed response",
     )
     client._send_push_notification = lambda *_args: None
@@ -311,15 +318,16 @@ class UnverifiedCallbackCancelSafety(unittest.TestCase):
         # generation while retaining the victim's task_id; then real SIGKILL
         # forces independent WAL recovery. Normal outcomes have separate controls.
         for outcome in ("SUCCESS", "FAILURE"):
-            with self.subTest(outcome=outcome):
-                task_id = self.new_task("cross-scope-" + outcome.lower())
-                rec = self.killed_callback(task_id, outcome, "stale")
-                self.assertEqual(
-                    (rec["state"], rec["effect_state"], rec["reply"]),
-                    (protocol.STATE_WORKING, "uncertain", ""),
-                    "unverified cross-scope callback must not commit " + outcome,
-                )
-                self.assertFalse(self.store.claim_dispatch(task_id))
+            for variant in ("stale", "spoofed"):
+                with self.subTest(outcome=outcome, variant=variant):
+                    task_id = self.new_task("cross-scope-" + outcome.lower() + "-" + variant)
+                    rec = self.killed_callback(task_id, outcome, variant)
+                    self.assertEqual(
+                        (rec["state"], rec["effect_state"], rec["reply"]),
+                        (protocol.STATE_WORKING, "uncertain", ""),
+                        "unverified cross-scope callback must not commit " + outcome + "/" + variant,
+                    )
+                    self.assertFalse(self.store.claim_dispatch(task_id))
 
     def test_direct_outcome_sink_rejects_unverified_canceled_without_side_effects(self):
         from unittest.mock import patch
