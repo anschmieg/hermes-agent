@@ -333,6 +333,9 @@ class A2AAdapter(BasePlatformAdapter):
         # FIFO so adapter.send() — which only knows the context — resolves the oldest task.
         self._pending: dict[str, tuple[str, Future]] = {}
         self._pending_order: dict[str, deque[str]] = {}
+        # One-process callback generation: only the exact MessageEvent handed to
+        # the gateway may settle a claimed durable task. Event metadata is untrusted.
+        self._pending_events: dict[str, tuple[MessageEvent, str, str, str, str, str]] = {}
         # Request ownership outlives reply Futures and also covers synchronous profile forwards.
         self._active_tasks: set[str] = set()
         # Admission ids this process already forwarded; a resend of one is a retry, not a new turn.
@@ -394,6 +397,7 @@ class A2AAdapter(BasePlatformAdapter):
                 self._resolve_locked(tid, protocol.STATE_FAILED, "[agent shutting down]")
             self._pending.clear()
             self._pending_order.clear()
+            self._pending_events.clear()
             self._active_tasks.clear()
 
     def _watchdog_loop(self) -> None:
@@ -539,6 +543,56 @@ class A2AAdapter(BasePlatformAdapter):
             self._pending_order.setdefault(context_id, deque()).append(task_id)
         return fut
 
+    def _bind_task_event(self, task_id: str, event: MessageEvent) -> bool:
+        """Bind a dispatched event to the journal's canonical owner, privately.
+
+        The binding keeps the original event object alive as this process's
+        generation. Neither message_id nor attacker-supplied event metadata or
+        an independently reconstructed event can establish callback authority.
+        """
+        rec = self.tasks.get(task_id)
+        if not rec or rec["state"] != protocol.STATE_WORKING or rec["effect_state"] != "uncertain":
+            return False
+        peer, slug, tenant, input_id = (
+            rec["peer"], rec["agent_slug"], rec["tenant"], rec["input_id"])
+        session = self._execution_context_id(
+            {"slug": slug, "tenant": tenant}, peer, rec["context_id"])
+        source = getattr(event, "source", None)
+        if (not input_id or getattr(event, "message_id", None) != task_id
+                or getattr(source, "chat_id", None) != session
+                or getattr(source, "user_id", None) != peer):
+            return False
+        with self._pending_lock:
+            pending = self._pending.get(task_id)
+            if not pending or pending[0] != session or pending[1].done():
+                return False
+            self._pending_events[task_id] = (event, session, peer, slug, tenant, input_id)
+            return True
+
+    def _resolve_verified_callback(self, task_id: str, event: MessageEvent,
+                                   state: str, text: str) -> bool:
+        """Only a live, exact-event callback for the journal's owner may settle."""
+        with self._pending_lock:
+            binding = self._pending_events.get(task_id)
+            pending = self._pending.get(task_id)
+            if not binding or not pending or binding[0] is not event:
+                return False
+            _original, session, peer, slug, tenant, input_id = binding
+            source = getattr(event, "source", None)
+            rec = self.tasks.get(task_id)
+            if (pending[0] != session
+                    or getattr(event, "message_id", None) != task_id
+                    or getattr(source, "chat_id", None) != session
+                    or getattr(source, "user_id", None) != peer
+                    or not rec or rec["state"] != protocol.STATE_WORKING
+                    or rec["effect_state"] != "uncertain"
+                    or (rec["peer"], rec["agent_slug"], rec["tenant"], rec["input_id"])
+                        != (peer, slug, tenant, input_id)
+                    or self._execution_context_id(
+                        {"slug": slug, "tenant": tenant}, peer, rec["context_id"]) != session):
+                return False
+            return self._resolve_locked(task_id, state, text)
+
     def _activate_task(self, task_id: str) -> None:
         with self._pending_lock:
             self._active_tasks.add(task_id)
@@ -563,6 +617,7 @@ class A2AAdapter(BasePlatformAdapter):
     def _pop_pending(self, task_id: str) -> None:
         with self._pending_lock:
             self._active_tasks.discard(task_id)
+            self._pending_events.pop(task_id, None)
             entry = self._pending.pop(task_id, None)
             order = self._pending_order.get(entry[0]) if entry else None
             if order and task_id in order:
@@ -732,6 +787,11 @@ class A2AAdapter(BasePlatformAdapter):
         fut = self._add_pending(task_id, execution_context_id)
         event = MessageEvent(text=framed, message_type=MessageType.TEXT, message_id=task_id,
                              source=self.build_source(chat_id=execution_context_id, chat_name=f"a2a:{peer}", chat_type="dm", user_id=peer, user_name=peer))
+        if not self._bind_task_event(task_id, event):
+            # Dispatch was already claimed durably. Never send a second copy.
+            logger.warning("A2A: unverified dispatch binding for task %s", task_id)
+            self._pop_pending(task_id)
+            return protocol.TaskStore.to_task(self.tasks.get(task_id) or rec), None
         try:
             asyncio.run_coroutine_threadsafe(self.handle_message(event), self._loop)
         except Exception:
@@ -1181,7 +1241,7 @@ class A2AAdapter(BasePlatformAdapter):
                 ProcessingOutcome.CANCELLED: (
                     protocol.STATE_WORKING, "[backend stop unverified; task outcome uncertain]"),
             }.get(outcome, default)
-            if self._resolve_task(task_id, state, reply):
+            if self._resolve_verified_callback(task_id, event, state, reply):
                 rec = self.tasks.get(task_id)
                 if rec:
                     try:
