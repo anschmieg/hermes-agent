@@ -222,6 +222,7 @@ def _callback_cancel_worker(db: str, task_id: str, outcome: str, stale: str) -> 
     client._pending_lock = threading.RLock()
     client._pending = {}
     client._pending_order = {}
+    client._pending_events = {}
     client._active_tasks = set()
     rec = client.tasks.get(task_id)
     assert rec is not None and rec["state"] == protocol.STATE_WORKING
@@ -230,12 +231,12 @@ def _callback_cancel_worker(db: str, task_id: str, outcome: str, stale: str) -> 
     context = client._execution_context_id(
         {"slug": rec["agent_slug"], "tenant": rec["tenant"]}, rec["peer"], rec["context_id"])
     future = client._add_pending(task_id, context)
-    assert stale in {"current", "stale", "spoofed"}
+    assert stale in {"current", "stale", "spoofed", "cloned"}
     forged = stale != "current"
     # Production MessageEvent from _prepare_task has empty metadata. It must
     # still settle a normal callback; trusting self-reported metadata is unsafe.
     # "spoofed" deliberately gives a foreign source the victim's metadata.
-    metadata = {} if not forged else {
+    metadata = {} if stale in {"current", "cloned"} else {
         "tenant": "tenant-b" if stale == "stale" else rec["tenant"],
         "peer": "mallory" if stale == "stale" else rec["peer"],
         "contextId": "foreign-context" if stale == "stale" else rec["context_id"],
@@ -244,10 +245,21 @@ def _callback_cancel_worker(db: str, task_id: str, outcome: str, stale: str) -> 
         "sessionId": "foreign-session" if stale == "stale" else context,
         "generation": "stale" if stale == "stale" else "current",
     }
-    event = SimpleNamespace(
+    # The genuine event is the object admitted by _prepare_task, not a
+    # separately reconstructed callback with matching self-reported fields.
+    genuine = SimpleNamespace(
         message_id=task_id,
-        source=SimpleNamespace(chat_id="foreign-session" if forged else context,
-                               user_id="mallory" if forged else rec["peer"]),
+        source=SimpleNamespace(chat_id=context, user_id=rec["peer"]),
+        metadata={},
+        _streamed_final_response="normal streamed response",
+    )
+    if hasattr(client, "_bind_task_event"):
+        assert client._bind_task_event(task_id, genuine)
+    event = genuine if not forged else SimpleNamespace(
+        message_id=task_id,
+        source=SimpleNamespace(
+            chat_id=context if stale == "cloned" else "foreign-session",
+            user_id=rec["peer"] if stale == "cloned" else "mallory"),
         metadata=metadata,
         _streamed_final_response="normal streamed response",
     )
@@ -327,7 +339,7 @@ class UnverifiedCallbackCancelSafety(unittest.TestCase):
         # generation while retaining the victim's task_id; then real SIGKILL
         # forces independent WAL recovery. Normal outcomes have separate controls.
         for outcome in ("SUCCESS", "FAILURE"):
-            for variant in ("stale", "spoofed"):
+            for variant in ("stale", "spoofed", "cloned"):
                 with self.subTest(outcome=outcome, variant=variant):
                     task_id = self.new_task("cross-scope-" + outcome.lower() + "-" + variant)
                     rec = self.killed_callback(task_id, outcome, variant)
