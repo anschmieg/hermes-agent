@@ -259,10 +259,10 @@ def _callback_cancel_worker(db: str, task_id: str, outcome: str, stale: str) -> 
     # Only a matching callback may fulfil the victim future. A rejected forged
     # callback may legitimately leave it pending; both paths must still reach
     # real SIGKILL so persistence is verified after independent WAL recovery.
-    if forged:
-        assert not future.done(), "foreign callback must not resolve victim HTTP future"
-    else:
-        assert future.done(), "matching completion must release waiting HTTP future"
+    # Always SIGKILL, even if the callback wrongly settled a Future; otherwise
+    # a genuine security RED would fail before the restart/WAL boundary.
+    marker = Path(db).with_name(Path(db).name + ".future-state")
+    marker.write_text("done" if future.done() else "pending", encoding="ascii")
     os.kill(os.getpid(), signal.SIGKILL)
 
 
@@ -290,12 +290,17 @@ class UnverifiedCallbackCancelSafety(unittest.TestCase):
         return rec["task_id"]
 
     def killed_callback(self, task_id: str, outcome: str, stale: str):
+        marker = self.db.with_name(self.db.name + ".future-state")
+        marker.unlink(missing_ok=True)
         proc = subprocess.run(
             [sys.executable, "-u", __file__, "--callback-worker",
              str(self.db), task_id, outcome, stale],
             cwd=Path(__file__).resolve().parents[2],
             capture_output=True, text=True, timeout=30)
         self.assertEqual(proc.returncode, -signal.SIGKILL, proc.stderr)
+        self.assertTrue(marker.is_file(), "SIGKILL worker did not record Future disposition")
+        self._last_future_state = marker.read_text(encoding="ascii")
+        self.assertIn(self._last_future_state, ("done", "pending"))
         # Force real process restart / WAL reopen, not just an in-memory snapshot.
         self.store = protocol.TaskStore(DurableTaskLedger(self.db))
         return self.store.get(task_id, "private", "tenant-a", "alice")
@@ -331,6 +336,8 @@ class UnverifiedCallbackCancelSafety(unittest.TestCase):
                         (protocol.STATE_WORKING, "uncertain", ""),
                         "unverified cross-scope callback must not commit " + outcome + "/" + variant,
                     )
+                    self.assertEqual(self._last_future_state, "pending",
+                                     "forged callback incorrectly released victim Future")
                     self.assertFalse(self.store.claim_dispatch(task_id))
 
     def test_direct_outcome_sink_rejects_unverified_canceled_without_side_effects(self):
@@ -359,6 +366,8 @@ class UnverifiedCallbackCancelSafety(unittest.TestCase):
                 task_id = self.new_task(name)
                 rec = self.killed_callback(task_id, outcome, "current")
                 self.assertEqual((rec["state"], rec["effect_state"]), (expected, "settled"))
+                self.assertEqual(self._last_future_state, "done",
+                                 "matching callback must release waiting Future")
                 if outcome == "SUCCESS":
                     self.assertEqual(rec["reply"], "normal streamed response")
 
