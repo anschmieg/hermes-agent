@@ -75,6 +75,32 @@ class SqliteDurability(unittest.TestCase):
             state=protocol.STATE_FAILED, reply="incorrect overwrite"))
         self.assertEqual(DurableTaskLedger(self.path).get(task["task_id"])["reply"], "final")
 
+    def test_wal_bootstrap_retries_transient_startup_lock(self):
+        """Concurrent first-use WAL activation must tolerate a transient lock."""
+        import sqlite3
+        from unittest.mock import patch
+
+        original_db = DurableTaskLedger._db
+        raised = []
+        class OneTimeBusyConnection:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def execute(self, sql, *args):
+                if sql == "PRAGMA journal_mode=WAL" and not raised:
+                    raised.append(True)
+                    raise sqlite3.OperationalError("database is locked")
+                return self.connection.execute(sql, *args)
+
+            def close(self):
+                self.connection.close()
+
+        with patch.object(DurableTaskLedger, "_db",
+                          lambda ledger: OneTimeBusyConnection(original_db(ledger))):
+            DurableTaskLedger(self.path)
+        self.assertEqual(raised, [True])
+        self.assertFalse(self.reserve()[1])
+
     def test_two_processes_racing_same_message_id(self):
         code = (
             "from plugins.platforms.a2a.ledger import DurableTaskLedger; import sys; "
@@ -177,7 +203,10 @@ class NativeHttpAcceptance(unittest.TestCase):
             self.count += 1
             try:
                 await asyncio.sleep(self.delay)
-                await a.send(event.source.chat_id, "ACK", metadata={"notify": True})
+                # Durable task settlement requires the gateway's correlated final reply.
+                # An unkeyed callback must remain unverified after worker restart.
+                await a.send(event.source.chat_id, "ACK", reply_to=event.message_id,
+                             metadata={"notify": True})
             except Exception:
                 self.errors.append(traceback.format_exc())
 

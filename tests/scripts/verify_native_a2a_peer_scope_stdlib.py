@@ -41,7 +41,9 @@ for name in ("MessageEvent", "MessageType", "ProcessingOutcome"):
     setattr(event, name, type(name, (), {}))
 config = _module("gateway.config")
 config.Platform = type("Platform", (), {})
-_module("agent", True)
+agent_pkg = _module("agent", True)
+# Preserve access to the *real* egress redactor; only gateway imports are shimmed.
+agent_pkg.__path__ = [str(Path(__file__).resolve().parents[2] / "agent")]
 proxy = _module("agent.proxy_bypass")
 proxy.is_loopback_host = lambda host: host in {"localhost", "127.0.0.1", "::1"}
 constants = _module("hermes_constants")

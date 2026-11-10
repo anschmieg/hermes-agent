@@ -43,7 +43,17 @@ class DurableTaskLedger:
             pass
         conn = self._db()
         try:
-            conn.execute("PRAGMA journal_mode=WAL")
+            # SQLite can reject simultaneous first-use WAL activation
+            # immediately, despite busy_timeout. Retry only transient locks;
+            # persistent locks and other SQLite errors remain fail-closed.
+            for attempt in range(5):
+                try:
+                    conn.execute("PRAGMA journal_mode=WAL")
+                    break
+                except sqlite3.OperationalError as exc:
+                    if "locked" not in str(exc).lower() or attempt == 4:
+                        raise
+                    time.sleep(0.05 * (attempt + 1))
             conn.execute("""CREATE TABLE IF NOT EXISTS a2a_tasks (
                 task_id TEXT PRIMARY KEY,
                 peer TEXT NOT NULL,
@@ -126,6 +136,19 @@ class DurableTaskLedger:
         Returns None for a lost claim, missing task, or attempted mutation of a
         terminal state. A claimed task remains WORKING after crash/restart.
         """
+        # Receipt identity is minted at admission, not mutable through task
+        # state transitions. Otherwise a stale/cross-tenant worker could
+        # retarget an idempotency record or its original Chief inputId.
+        immutable = {"task_id", "context_id", "peer", "agent_slug", "tenant",
+                     "message_id", "input_id", "created_at", "created_iso",
+                     "stop_attempt_state", "stop_attempted_at"}
+        if immutable.intersection(fields):
+            return None
+        # allow_terminal is exclusively for push-configuration metadata after
+        # settlement. Never let a stale worker rewrite an authoritative outcome
+        # or forge cancellation through this metadata-only escape hatch.
+        if allow_terminal and (claim or not fields.keys() <= {"push_url", "push_config_id"}):
+            return None
         conn = self._db()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -134,6 +157,13 @@ class DurableTaskLedger:
                 conn.rollback()
                 return None
             rec = json.loads(row[0])
+            # A fenced STOP attempt records intent, never backend confirmation.
+            # A late/unverified cancel event cannot settle the side effect, even
+            # through allow_terminal metadata updates after crash or restart.
+            if (rec.get("stop_attempt_state") == "uncertain"
+                    and fields.get("state") == "TASK_STATE_CANCELED"):
+                conn.rollback()
+                return None
             if not allow_terminal and rec["state"] in {
                 "TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_CANCELED", "TASK_STATE_REJECTED"
             }:
@@ -150,6 +180,45 @@ class DurableTaskLedger:
                     return None
                 fields.update(state="TASK_STATE_WORKING", effect_state="uncertain")
             rec.update(fields)
+            conn.execute("UPDATE a2a_tasks SET record=? WHERE task_id=?",
+                         (json.dumps(rec, separators=(",", ":")), task_id))
+            conn.commit()
+            return rec
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def claim_stop_attempt(self, task_id: str, *, peer: str, agent_slug: str,
+                           tenant: str, input_id: str) -> dict | None:
+        """Fence a remote stop attempt before any backend call.
+
+        This is NOT stop confirmation: after a crash the marker is uncertain
+        and the stop must not be sent again. Reconcile only by authenticated,
+        read-only lookup of the original owner inputId; a terminal CANCELED
+        receipt additionally requires independent backend-confirmed stop.
+        """
+        if not peer or not input_id:
+            return None
+        conn = self._db()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT record FROM a2a_tasks WHERE task_id=?",
+                               (task_id,)).fetchone()
+            if row is None:
+                conn.rollback()
+                return None
+            rec = json.loads(row[0])
+            if (rec.get("peer") != peer or rec.get("agent_slug", "") != agent_slug
+                    or rec.get("tenant", "") != tenant or rec.get("input_id") != input_id
+                    or rec.get("state") != "TASK_STATE_WORKING"
+                    or rec.get("effect_state") != "uncertain"
+                    or rec.get("stop_attempt_state")):
+                conn.rollback()
+                return None
+            rec["stop_attempt_state"] = "uncertain"
+            rec["stop_attempted_at"] = time.time()
             conn.execute("UPDATE a2a_tasks SET record=? WHERE task_id=?",
                          (json.dumps(rec, separators=(",", ":")), task_id))
             conn.commit()

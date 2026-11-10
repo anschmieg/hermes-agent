@@ -19,6 +19,9 @@ import verify_native_a2a_peer_scope_stdlib  # noqa: F401 - gateway import shims
 from plugins.platforms.a2a import adapter, protocol
 from plugins.platforms.a2a.ledger import DurableTaskLedger
 
+# Include status-gate SIGKILL regressions in the official late-reply suite.
+from verify_native_a2a_forward_terminal_gate import ForwardTerminalReceiptGate
+
 
 class LateReplyBinding(unittest.TestCase):
     def setUp(self):

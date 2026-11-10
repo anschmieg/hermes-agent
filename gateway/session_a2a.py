@@ -138,7 +138,11 @@ async def forward(connection, params):
     receipt = await authority.submit(actor, Submission(params['input_id'], ref, {'text': params['text']}, 'queue'))
     from gateway.session_results import admission_result
     saved = admission_result(authority.db, receipt.admission_id)
+    # The authenticated owner echoes the exact admission identity, enabling
+    # the A2A caller to reject a delayed/foreign terminal receipt after restart.
     return dict(asdict(receipt), session_id=ref.session_id,
+                agent=params['agent'], tenant=params['tenant'], peer=params['peer'],
+                context_id=params['context_id'], input_id=params['input_id'],
                 result=saved['result'] if saved is not None else None)
 
 
