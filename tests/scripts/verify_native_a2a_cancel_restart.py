@@ -225,9 +225,11 @@ def _callback_cancel_worker(db: str, task_id: str, outcome: str, stale: str) -> 
     client._active_tasks = set()
     rec = client.tasks.get(task_id)
     assert rec is not None and rec["state"] == protocol.STATE_WORKING
-    future = client._add_pending(task_id, rec["context_id"])
+    # Match _prepare_task: only the derived PRIVATE session key is registered
+    # with the callback Future, never caller-controlled external contextId.
     context = client._execution_context_id(
         {"slug": rec["agent_slug"], "tenant": rec["tenant"]}, rec["peer"], rec["context_id"])
+    future = client._add_pending(task_id, context)
     assert stale in {"current", "stale", "spoofed"}
     forged = stale != "current"
     # Production MessageEvent from _prepare_task has empty metadata. It must
@@ -257,7 +259,9 @@ def _callback_cancel_worker(db: str, task_id: str, outcome: str, stale: str) -> 
     # Only a matching callback may fulfil the victim future. A rejected forged
     # callback may legitimately leave it pending; both paths must still reach
     # real SIGKILL so persistence is verified after independent WAL recovery.
-    if not forged:
+    if forged:
+        assert not future.done(), "foreign callback must not resolve victim HTTP future"
+    else:
         assert future.done(), "matching completion must release waiting HTTP future"
     os.kill(os.getpid(), signal.SIGKILL)
 
